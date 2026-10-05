@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: smart-study-room
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: QR_SECRET
+        generateValue: true
+      - key: FIREBASE_PROJECT_ID
+        value: smart-booking-82438
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
