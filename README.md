@@ -23,7 +23,7 @@ Không cần kích hoạt `.venv` bằng `Activate.ps1`. Mở http://127.0.0.1:8
 
 - Đăng nhập demo phân vai User/Administrator.
 - User tìm phòng, chọn ngày/giờ và thời lượng, đặt trực tiếp hoặc mở bong bóng chat nổi ở góc dưới bên phải. Chatbot chào người dùng mới, có gợi ý hỏi về dịch vụ, loại phòng, bảng giá hoặc bắt đầu đặt; người dùng quen có thể nhập thẳng yêu cầu. Chatbot hỏi đủ số người, ngày tương lai, giờ và thời lượng; ngày quá khứ bị từ chối. Khi chatbot tạo booking sau khi user xác nhận, QR hiện trong popup. QR cũng có nút mở lại từ booking chưa check-in.
-- Thẻ phòng dùng minh họa SVG riêng cho phòng học, phòng thảo luận, phòng lab và phòng nhóm; lưới giữ chiều cao thống nhất.
+- Thẻ bốn phòng dùng ảnh chụp phòng học, phòng họp và phòng máy từ Unsplash; nếu ảnh mạng lỗi, thẻ tự dùng ảnh SVG dự phòng trong `static/images`.
 - Chatbot hiểu ngày như `29/09/2026`, `2026-09-29`, `ngày 29 tháng 9`, hôm nay/ngày mai và thứ trong tuần; thời lượng như `90 phút`, `2 tiếng`, `2 tiếng 30 phút`.
 - Chatbot trả lời yêu cầu giới thiệu loại phòng bằng danh sách phòng, sức chứa, tiện nghi và giá lấy từ database.
 - Booking được chống xung đột bằng transaction SQLite/Firestore; vòng đời tự chuyển booking quá hạn chưa check-in sang `NO_SHOW`, tự kết thúc booking đã check-in và tắt thiết bị mô phỏng khi hết giờ. QR ký HMAC, gắn booking/phòng và thời hạn.
