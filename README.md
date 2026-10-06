@@ -88,7 +88,7 @@ Backend đăng ký nhận ba loại topic telemetry/status ở trên; lệnh nh�
 
 ## Kết nối chatbot với Groq
 
-Chatbot dùng model `openai/gpt-oss-20b` qua Groq Chat Completions API. Các câu mẫu như chào hỏi, dịch vụ, bảng giá, loại phòng, booking và luồng đặt phòng vẫn được xử lý nội bộ bằng dữ liệu thật. Chỉ câu hỏi chưa có mẫu mới gửi tới Groq để AI tự trả lời. Booking, hủy booking, giá và tình trạng phòng vẫn do code của app xử lý; model không thể tự xác nhận giao dịch.
+Chatbot dùng model `openai/gpt-oss-20b` qua Groq Chat Completions API. Các câu mẫu như chào hỏi, dịch vụ, bảng giá, loại phòng và cú pháp booking quen thuộc vẫn được xử lý nội bộ. Khi người dùng diễn đạt yêu cầu đặt phòng tự nhiên hoặc bằng tiếng Anh, Groq trích xuất số người, ngày, giờ, thời lượng, tiện ích và loại phòng; app dùng dữ liệu thật để kiểm tra phòng trống, tính giá và vẫn yêu cầu xác nhận trước khi tạo booking. AI không tự bịa tình trạng phòng, giá hoặc tự xác nhận giao dịch. Câu hỏi kiến thức chưa có mẫu cũng được gửi tới Groq để trả lời.
 
 1. Tạo API key trong [Groq Console](https://console.groq.com/keys). Giữ tài khoản ở Free tier nếu không muốn dùng gói trả phí. Không gửi key qua chat, không đặt vào mã nguồn hoặc trình duyệt.
 2. Local PowerShell, chỉ áp dụng cho cửa sổ hiện tại:

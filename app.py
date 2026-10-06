@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import hmac
 import io
@@ -40,6 +41,7 @@ SECRET = os.getenv("QR_SECRET", "demo-only-change-this-secret").encode()
 LOCK = threading.RLock()
 CHAT: dict[str, dict[str, Any]] = {}
 AI_CHAT: dict[str, list[dict[str, str]]] = {}
+CHAT_REQUEST_MESSAGE = contextvars.ContextVar("chat_request_message", default=None)
 SESSIONS: dict[str, dict[str, str]] = {}
 MQTT_CLIENT = None
 MQTT_CONNECTED = False
@@ -1254,11 +1256,11 @@ def groq_chat_reply(message: str, identity: dict[str, str], session_id: str) -> 
     if len(history) > 16:
         del history[:-16]
     system_prompt = (
-        "Bạn là trợ lý tiếng Việt thân thiện của Smart Study Room. Trả lời trực tiếp, tự nhiên và ngắn gọn. "
-        "Bạn có thể giải đáp câu hỏi ngoài các câu mẫu, nhưng không được bịa giá, tình trạng phòng, booking hoặc chính sách của hệ thống. "
-        "Ứng dụng tự xử lý tra cứu phòng, giá, booking, hủy và các bước đặt phòng bằng dữ liệu thật; bạn không được khẳng định đã tạo hoặc hủy booking. "
-        "Nếu câu hỏi cần dữ liệu riêng của hệ thống mà chưa được cung cấp, hãy nói rõ và hướng dẫn người dùng dùng mục tương ứng trên trang. "
-        "Với câu hỏi ngoài phạm vi đặt phòng, có thể trả lời kiến thức chung nhưng nêu rõ khi không chắc chắn."
+        "You are the friendly Smart Study Room assistant. Reply in the same language as the user's latest message. "
+        "Keep answers direct, natural, and concise. You may answer questions beyond canned patterns, but never invent room prices, availability, bookings, or system policies. "
+        "The application handles room lookup, prices, booking, cancellation, and booking steps using live data; never claim that you created or cancelled a booking. "
+        "If a question requires private system data that was not provided, say so and direct the user to the relevant page feature. "
+        "For questions outside room booking, you may answer with general knowledge and state when you are uncertain."
     )
     payload = {
         "model": GROQ_MODEL,
@@ -1293,15 +1295,157 @@ def groq_chat_reply(message: str, identity: dict[str, str], session_id: str) -> 
     return answer
 
 
+def groq_translate_chat_reply(user_message: str, reply: str) -> Optional[str]:
+    """Translate a local canned response into the language used by the user."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Translate the assistant reply into the main language used in the user's message. "
+                    "Translate only; do not answer the user or add information. Preserve every number, date, time, price, "
+                    "booking ID, room code, and proper name exactly. Output only the translated reply."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"user_message": user_message[:1000], "assistant_reply": reply[:2500]}, ensure_ascii=False),
+            },
+        ],
+        "temperature": 0,
+        "max_completion_tokens": 700,
+    }
+    request = urllib.request.Request(
+        GROQ_CHAT_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "SmartStudyRoom/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    choices = result.get("choices") or []
+    content = choices[0].get("message", {}).get("content") if choices else None
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return content.strip() if isinstance(content, str) and content.strip() else None
+
+
+def groq_parse_booking_request(message: str, rooms: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Use Groq to translate a natural-language booking request into slots only.
+
+    Availability, pricing, confirmation, and booking creation stay in local code.
+    """
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+    today = now().astimezone().date().isoformat()
+    room_context = [
+        {"name": room.get("name"), "capacity": room.get("capacity"), "amenities": room.get("amenities", [])}
+        for room in rooms
+    ]
+    prompt = (
+        "Extract a user's room-booking request from any language. Return exactly one JSON object and no markdown. "
+        "Use these keys: intent (book_room or other), people (integer or null), date (YYYY-MM-DD string or null), "
+        "start_time and end_time (HH:MM strings or null), duration_minutes (integer or null), "
+        "amenities (array of canonical names), and room_name (string or null). Example: "
+        "{\"intent\":\"book_room\",\"people\":2,\"date\":\"2026-10-09\",\"start_time\":\"14:00\","
+        "\"end_time\":\"16:00\",\"duration_minutes\":120,\"amenities\":[\"Quạt\",\"Đèn\"],\"room_name\":null}. "
+        "Canonical amenities are the exact Vietnamese labels in room data; map light/lamp to Đèn, fan to Quạt, speaker to Loa. "
+        "Resolve relative dates using today's local date " + today + ". 'This Friday' means the upcoming Friday (today if today is Friday); "
+        "'next Friday' means the Friday of the following week. Convert 2pm to 14:00. "
+        "Do not invent omitted booking details; use null. This is extraction only: never claim availability, price, confirmation, or booking creation. "
+        "Room catalog: " + json.dumps(room_context, ensure_ascii=False)
+    )
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": message[:2000]},
+        ],
+        "temperature": 0,
+        # Leave room for GPT-OSS reasoning plus the small JSON result.
+        "max_completion_tokens": 1024,
+        # JSON Object Mode avoids provider-specific JSON Schema validation quirks;
+        # the application validates every extracted field before using it.
+        "response_format": {"type": "json_object"},
+    }
+    if GROQ_MODEL.startswith("openai/gpt-oss-"):
+        payload["reasoning_format"] = "hidden"
+        payload["reasoning_effort"] = "low"
+    request = urllib.request.Request(
+        GROQ_CHAT_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "SmartStudyRoom/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    choices = result.get("choices") or []
+    content = choices[0].get("message", {}).get("content") if choices else None
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    if not isinstance(content, str):
+        return None
+    content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip(), flags=re.I)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _logged_chat_reply(payload: dict, source: str = "local") -> dict:
     model = f" model={GROQ_MODEL}" if source == "groq" else ""
     print(f"CHAT_REPLY source={source}{model}", flush=True)
+    user_message = CHAT_REQUEST_MESSAGE.get()
+    if source != "groq" and isinstance(payload.get("reply"), str) and user_message:
+        if not re.search(r"[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]", user_message.casefold()) and not re.search(
+            r"\b(tôi|mình|minh|toi|phòng|phong|đặt|dat|cần|can|muốn|muon|ngày|ngay|giờ|gio|quạt|quat|đèn|den)\b",
+            user_message.casefold(),
+        ):
+            try:
+                translated = groq_translate_chat_reply(user_message, payload["reply"])
+                if translated:
+                    payload["reply"] = translated
+                    print("CHAT_TRANSLATION source=groq", flush=True)
+            except Exception as exc:
+                detail = ""
+                if hasattr(exc, "read"):
+                    try:
+                        detail = exc.read().decode("utf-8", errors="replace")[:300]
+                    except Exception:
+                        pass
+                print("Groq translation unavailable (%s): %s%s" % (
+                    type(exc).__name__, str(exc), ("; response=" + detail) if detail else ""
+                ), flush=True)
+    CHAT_REQUEST_MESSAGE.set(None)
     return payload
 
 
 @app.post("/api/chat")
 def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     message = data.message.strip()
+    CHAT_REQUEST_MESSAGE.set(message)
     state = CHAT.setdefault(identity["user_id"] + ":" + data.session_id, {})
     normalized = message.casefold()
     time_range_match = re.search(
@@ -1344,6 +1488,104 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if detected_filter:
         room_filter = detected_filter
         state["room_filter"] = room_filter
+
+    # Default Vietnamese booking patterns below continue to use deterministic
+    # local parsing. Send less structured / natural-language room requests to
+    # Groq for slot extraction, then keep availability and confirmation local.
+    natural_booking_hint = bool(
+        re.search(r"\b(?:i\s+)?(?:want|need|book|reserve|find|get|looking\s+for)\b.{0,120}\broom\b", normalized)
+        or re.search(r"\broom\b.{0,100}\b(?:for\s+\w+\s+(?:people|persons|guests)|from\s+\d|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", normalized)
+        or re.search(r"\b(?:mình|tôi|em|anh|chị)?\s*(?:muốn|cần|đặt|tìm|thuê)\b.{0,120}\bphòng\b", normalized)
+    )
+    groq_booking_slots = None
+    if natural_booking_hint:
+        if not os.getenv("GROQ_API_KEY", "").strip():
+            return _logged_chat_reply({"reply": "Để hiểu yêu cầu đặt phòng tự nhiên này, app cần GROQ_API_KEY. Hãy cấu hình key rồi khởi động lại server."})
+        try:
+            groq_booking_slots = groq_parse_booking_request(message, available_rooms)
+        except Exception as exc:
+            detail = ""
+            if hasattr(exc, "read"):
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+            print("Groq booking parser unavailable (%s): %s%s" % (
+                type(exc).__name__, str(exc), ("; response=" + detail) if detail else ""
+            ), flush=True)
+            status = getattr(exc, "code", None)
+            error_hint = f"Groq trả HTTP {status}. " if status else ""
+            return _logged_chat_reply({"reply": error_hint + "Mình chưa phân tích được yêu cầu đặt phòng. Hãy xem log terminal để biết chi tiết, hoặc gửi lại số người, ngày, giờ và tiện ích cần dùng nhé."})
+
+        if not isinstance(groq_booking_slots, dict):
+            print("Groq booking parser returned empty or invalid JSON", flush=True)
+            return _logged_chat_reply({"reply": "Groq chưa trả được dữ liệu đặt phòng theo định dạng cần thiết. Hãy gửi lại yêu cầu hoặc nhập số người, ngày, giờ và tiện ích thành từng tin nhắn nhé."})
+
+        if groq_booking_slots and str(groq_booking_slots.get("intent", "")).casefold() == "book_room":
+            state["local_booking_flow"] = True
+            people_value = groq_booking_slots.get("people")
+            if isinstance(people_value, int) and not isinstance(people_value, bool) and 1 <= people_value <= 100:
+                state["people"] = people_value
+            date_value = groq_booking_slots.get("date")
+            # Relative weekdays are deterministic; never let an LLM turn Friday
+            # into a calendar date with the wrong weekday.
+            weekday_names = {
+                "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                "friday": 4, "saturday": 5, "sunday": 6,
+            }
+            explicit_date_in_message = bool(
+                re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", normalized)
+                or re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b", normalized)
+            )
+            english_weekday = re.search(
+                r"\b(?:(this|next)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                normalized,
+            )
+            if english_weekday and not explicit_date_in_message:
+                local_today_for_weekday = now().astimezone().date()
+                target_weekday = weekday_names[english_weekday.group(2)]
+                weekday_offset = (target_weekday - local_today_for_weekday.weekday()) % 7
+                if english_weekday.group(1) == "next":
+                    weekday_offset += 7
+                date_value = (local_today_for_weekday + timedelta(days=weekday_offset)).isoformat()
+            if isinstance(date_value, str):
+                try:
+                    state["date"] = date.fromisoformat(date_value).isoformat()
+                except ValueError:
+                    pass
+            start_value = groq_booking_slots.get("start_time")
+            end_value = groq_booking_slots.get("end_time")
+            time_pattern = r"^(?:[01]?\d|2[0-3]):[0-5]\d$"
+            if isinstance(start_value, str) and re.fullmatch(time_pattern, start_value):
+                state["time"] = start_value.zfill(5)
+                start_minutes = int(start_value.split(":")[0]) * 60 + int(start_value.split(":")[1])
+                duration_value = groq_booking_slots.get("duration_minutes")
+                if isinstance(end_value, str) and re.fullmatch(time_pattern, end_value):
+                    end_minutes = int(end_value.split(":")[0]) * 60 + int(end_value.split(":")[1])
+                    if end_minutes <= start_minutes:
+                        end_minutes += 24 * 60
+                    duration_value = end_minutes - start_minutes
+                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and 15 <= duration_value <= 12 * 60:
+                    state["duration_minutes"] = duration_value
+            aliases_to_names = {
+                "đèn": "Đèn", "den": "Đèn", "lamp": "Đèn", "light": "Đèn", "lights": "Đèn",
+                "quạt": "Quạt", "quat": "Quạt", "fan": "Quạt", "fans": "Quạt",
+                "loa": "Loa", "speaker": "Loa", "speakers": "Loa",
+            }
+            ai_amenities = groq_booking_slots.get("amenities")
+            if isinstance(ai_amenities, list):
+                for value in ai_amenities:
+                    if isinstance(value, str) and value.casefold() in aliases_to_names:
+                        requested_amenities.add(aliases_to_names[value.casefold()])
+                if requested_amenities:
+                    state["amenities"] = sorted(requested_amenities)
+            ai_room_name = groq_booking_slots.get("room_name")
+            if isinstance(ai_room_name, str) and ai_room_name.strip():
+                matched_room = next((room for room in available_rooms if ai_room_name.casefold() in room.get("name", "").casefold()), None)
+                if matched_room:
+                    room_filter = matched_room.get("name")
+                    state["room_filter"] = room_filter
+            print("CHAT_PARSE source=groq intent=book_room model=%s" % GROQ_MODEL, flush=True)
 
     if re.search(r"(trạng thái|tình trạng).*(booking|đặt phòng)|booking.*(của tôi|nào|trạng thái)|đặt phòng của tôi", normalized):
         state.pop("pending_confirm", None)
@@ -1411,6 +1653,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or re.search(r"\b\d{1,2}\s*(?:h|:)\s*\d{0,2}\b", normalized)
         or time_range_match
         or re.search(r"\d+(?:[.,]\d+)?\s*(?:tiếng|giờ|hours|phút|phut|min|minutes)", normalized)
+        or (groq_booking_slots and str(groq_booking_slots.get("intent", "")).casefold() == "book_room")
     )
     is_general_question = bool(
         re.search(r"(?<!\w)\d+(?:[.,]\d+)?\s*(?:\+|-|\*|/|×|÷)\s*\d+(?:[.,]\d+)?(?!\w)", normalized)
@@ -1600,7 +1843,9 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if re.search(r"\b(xác nhận|đồng ý|đặt phòng|confirm)\b", message, re.I):
         if state.get("pending_confirm"):
             try:
-                booking = create_booking(BookingIn(room_id=room["id"], start=state["start"], end=state["end"], people=state["people"], idempotency_key="chat-" + uuid.uuid4().hex), identity)
+                selected_amenities = {str(value).casefold() for value in state.get("amenities", [])}
+                amenity_ids = [str(item["id"]) for item in get_amenities() if item.get("name", "").casefold() in selected_amenities]
+                booking = create_booking(BookingIn(room_id=room["id"], start=state["start"], end=state["end"], people=state["people"], amenity_ids=amenity_ids, idempotency_key="chat-" + uuid.uuid4().hex), identity)
             except HTTPException as exc:
                 return _logged_chat_reply({"reply": "Không thể tạo booking: " + str(exc.detail), "rooms": choices})
             state.clear()
