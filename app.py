@@ -517,7 +517,9 @@ def transition_firestore_booking(booking_id: str, expected: str, target: str) ->
 def process_booking_lifecycle() -> None:
     current = now()
     if FIRESTORE is not None:
-        bookings = fs_bookings()
+        # Lifecycle only needs active bookings; scanning the entire collection on
+        # every worker tick burns Firestore reads as the history grows.
+        bookings = fs_bookings(statuses=("CONFIRMED", "CHECKED_IN"))
         for booking in bookings:
             status = booking.get("status")
             try:
@@ -574,16 +576,30 @@ def process_booking_lifecycle() -> None:
 
 
 def lifecycle_worker() -> None:
-    while not LIFECYCLE_STOP.wait(15):
+    interval = 60 if FIRESTORE is not None else 15
+    while not LIFECYCLE_STOP.wait(interval):
         try:
             process_booking_lifecycle()
         except Exception as exc:
             print("Booking lifecycle worker error %s: %s" % (type(exc).__name__, str(exc)), flush=True)
 
 
-def fs_bookings() -> list[dict[str, Any]]:
+def fs_bookings(*, user_id: Optional[str] = None, statuses: Optional[tuple[str, ...]] = None,
+                room_id: Optional[int] = None, limit: Optional[int] = None) -> list[dict[str, Any]]:
     result = []
-    for doc in FIRESTORE.collection("bookings").stream():
+    query = FIRESTORE.collection("bookings")
+    if user_id is not None:
+        query = query.where("user_id", "==", user_id)
+    if room_id is not None:
+        query = query.where("room_id", "==", room_id)
+    if statuses:
+        if len(statuses) == 1:
+            query = query.where("status", "==", statuses[0])
+        else:
+            query = query.where("status", "in", list(statuses))
+    if limit is not None:
+        query = query.order_by("created", direction=firestore.Query.DESCENDING).limit(limit)
+    for doc in query.stream():
         item = doc.to_dict()
         item.setdefault("id", doc.id)
         result.append(item)
@@ -642,10 +658,10 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
         room = room_snapshot.to_dict()
         if data.people > int(room.get("capacity", 0)):
             raise HTTPException(400, "Số người vượt sức chứa phòng")
-        room_bookings = transaction.get(FIRESTORE.collection("bookings").where("room_id", "==", data.room_id))
-        for snapshot in room_bookings:
+        active_bookings = transaction.get(FIRESTORE.collection("bookings").where("status", "in", ["CONFIRMED", "CHECKED_IN"]))
+        for snapshot in active_bookings:
             other = snapshot.to_dict()
-            if other.get("status") in ("CONFIRMED", "CHECKED_IN") and other.get("start", "") < stamp(end) and other.get("end", "") > stamp(start):
+            if other.get("room_id") == data.room_id and other.get("start", "") < stamp(end) and other.get("end", "") > stamp(start):
                 raise HTTPException(409, "Phòng vừa được đặt trong khoảng thời gian này")
         cost = round(int(room.get("hourly_rate", 0)) * (end - start).total_seconds() / 3600)
         booking = {
@@ -882,6 +898,8 @@ def parse_dt(raw: str) -> datetime:
 def free_rooms(start: datetime, end: datetime, people: int, amenities: Optional[list[str]] = None) -> list[dict[str, Any]]:
     if FIRESTORE is not None:
         requested = {a.casefold() for a in (amenities or [])}
+        active_bookings = fs_bookings(statuses=("CONFIRMED", "CHECKED_IN"))
+        start_text, end_text = stamp(start), stamp(end)
         result = []
         for room in fs_rooms():
             if int(room.get("capacity", 0)) < people:
@@ -889,7 +907,13 @@ def free_rooms(start: datetime, end: datetime, people: int, amenities: Optional[
             current_amenities = room.get("amenities", [])
             if requested and not requested.issubset({a.casefold() for a in current_amenities}):
                 continue
-            if not fs_booking_conflict(room["id"], stamp(start), stamp(end)):
+            room_is_booked = any(
+                booking.get("room_id") == room["id"]
+                and booking.get("start", "") < end_text
+                and booking.get("end", "") > start_text
+                for booking in active_bookings
+            )
+            if not room_is_booked:
                 result.append(room)
         return sorted(result, key=lambda room: room.get("hourly_rate", 0))
     with db() as c:
@@ -1146,8 +1170,15 @@ def create_booking(data: BookingIn, identity: dict[str, str] = Depends(current_u
 @app.get("/api/bookings")
 def list_bookings(identity: dict[str, str] = Depends(current_user)):
     if FIRESTORE is not None:
-        items = [b for b in fs_bookings() if b.get("user_id") == identity["user_id"]]
-        return [booking_view(b) for b in sorted(items, key=lambda b: b.get("created", ""), reverse=True)]
+        try:
+            items = fs_bookings(user_id=identity["user_id"])
+        except Exception as exc:
+            if type(exc).__name__ == "ResourceExhausted":
+                print("Firestore booking list throttled: quota exceeded", flush=True)
+                raise HTTPException(503, "Firestore đang giới hạn lượt đọc. Thử tải lại sau ít phút.") from exc
+            raise
+        items.sort(key=lambda booking: booking.get("created", ""), reverse=True)
+        return [booking_view(item) for item in items[:50]]
     with db() as c:
         return [booking_view(r) for r in c.execute("SELECT * FROM bookings WHERE user_id=? ORDER BY created DESC", (identity["user_id"],)).fetchall()]
 
@@ -1321,8 +1352,8 @@ def telemetry(data: TelemetryIn):
         fs_update_room(data.room_id, updates)
         fs_add_audit("http-controller", "TELEMETRY", "room=%s; occupied=%s; online=%s; devices=%s" % (data.room_id, data.occupied, data.online, json.dumps(devices)))
         if not data.occupied:
-            for booking in fs_bookings():
-                if booking.get("room_id") == data.room_id and booking.get("status") == "CHECKED_IN" and booking.get("end", "") <= stamp(now()):
+            for booking in fs_bookings(room_id=data.room_id):
+                if booking.get("status") == "CHECKED_IN" and booking.get("end", "") <= stamp(now()):
                     FIRESTORE.collection("bookings").document(booking["id"]).update({"status": "COMPLETED"})
         return {"ok": True, "room_id": data.room_id, "online": data.online, "occupied": data.occupied, "devices": devices, "transport": "http-simulation"}
     with db() as c:
@@ -1805,7 +1836,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
 
     if re.search(r"(trạng thái|tình trạng).*(booking|đặt phòng)|booking.*(của tôi|nào|trạng thái)|đặt phòng của tôi", normalized):
         state.pop("pending_confirm", None)
-        items = [b for b in fs_bookings() if b.get("user_id") == identity["user_id"]] if FIRESTORE is not None else list_bookings(identity)
+        items = fs_bookings(user_id=identity["user_id"]) if FIRESTORE is not None else list_bookings(identity)
         items = sorted(items, key=lambda booking: booking.get("created", ""), reverse=True)[:5]
         if not items:
             return _logged_chat_reply({"reply": "Bạn chưa có booking nào."})
@@ -1813,7 +1844,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         return _logged_chat_reply({"reply": "Booking gần đây của bạn:\n" + "\n".join(lines)})
     if re.search(r"(hủy|huy).*(booking|đặt phòng|phòng)|((booking|đặt phòng).*(hủy|huy))", normalized):
         state.pop("pending_confirm", None)
-        items = [b for b in fs_bookings() if b.get("user_id") == identity["user_id"] and b.get("status") == "CONFIRMED"] if FIRESTORE is not None else [b for b in list_bookings(identity) if b.get("status") == "CONFIRMED"]
+        items = fs_bookings(user_id=identity["user_id"], statuses=("CONFIRMED",)) if FIRESTORE is not None else [b for b in list_bookings(identity) if b.get("status") == "CONFIRMED"]
         short_id = re.search(r"\b([0-9a-f]{8})\b", normalized)
         if short_id:
             items = [b for b in items if b["id"].startswith(short_id.group(1))]
@@ -2191,10 +2222,9 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
 def get_audit(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
     if FIRESTORE is not None:
-        items = [doc.to_dict() for doc in FIRESTORE.collection("audit").stream()]
-        return sorted(items, key=lambda item: item.get("at", ""), reverse=True)[:200]
+        return [doc.to_dict() for doc in FIRESTORE.collection("audit").order_by("at", direction=firestore.Query.DESCENDING).limit(50).stream()]
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200").fetchall()]
+        return [dict(r) for r in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 50").fetchall()]
 
 
 @app.get("/api/admin/devices")
@@ -2264,7 +2294,7 @@ def admin_bookings(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
     if FIRESTORE is not None:
         rooms_by_id = {r["id"]: r["name"] for r in fs_rooms()}
-        items = [dict(booking_view(b), room_name=rooms_by_id.get(b.get("room_id"), "Phòng")) for b in fs_bookings()]
-        return sorted(items, key=lambda booking: booking.get("created", ""), reverse=True)
+        items = [dict(booking_view(b), room_name=rooms_by_id.get(b.get("room_id"), "Phòng")) for b in fs_bookings(limit=100)]
+        return items
     with db() as c:
-        return [dict(booking_view(r), room_name=r["room_name"]) for r in c.execute("SELECT b.*,r.name room_name FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.created DESC").fetchall()]
+        return [dict(booking_view(r), room_name=r["room_name"]) for r in c.execute("SELECT b.*,r.name room_name FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.created DESC LIMIT 100").fetchall()]
