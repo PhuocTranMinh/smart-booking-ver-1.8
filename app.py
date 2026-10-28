@@ -42,6 +42,7 @@ LOCK = threading.RLock()
 CHAT: dict[str, dict[str, Any]] = {}
 AI_CHAT: dict[str, list[dict[str, str]]] = {}
 CHAT_REQUEST_MESSAGE = contextvars.ContextVar("chat_request_message", default=None)
+CHAT_REPLY_LANGUAGE = contextvars.ContextVar("chat_reply_language", default="vi")
 SESSIONS: dict[str, dict[str, str]] = {}
 MQTT_CLIENT = None
 MQTT_CONNECTED = False
@@ -147,6 +148,10 @@ def init_db() -> None:
                     c.execute("INSERT INTO room_amenities(room_id,amenity_id) VALUES(?,?)", (room["id"], amenity_id))
                 c.execute("UPDATE rooms SET amenities='[]' WHERE id=?", (room["id"],))
             c.execute("INSERT INTO app_meta(key,value) VALUES('amenity_catalog_v2','done')")
+        if not c.execute("SELECT 1 FROM app_meta WHERE key='all_rooms_have_all_amenities_v1'").fetchone():
+            c.execute("""INSERT OR IGNORE INTO room_amenities(room_id,amenity_id)
+              SELECT rooms.id,amenities.id FROM rooms CROSS JOIN amenities""")
+            c.execute("INSERT INTO app_meta(key,value) VALUES('all_rooms_have_all_amenities_v1','done')")
         device_names = {"lamp": "Đèn", "fan": "Quạt", "speaker": "Loa"}
         for room in c.execute("SELECT id FROM rooms").fetchall():
             for device, label in device_names.items():
@@ -170,13 +175,13 @@ def init_firestore() -> None:
         FIRESTORE = firestore.Client(project=FIREBASE_PROJECT_ID)
     seed_firestore_rooms()
     migrate_firestore_amenities()
+    assign_all_amenities_to_rooms_once()
     seed_firestore_users_and_devices()
+    sync_firestore_room_summaries()
 
 
 def seed_firestore_rooms() -> None:
     collection = FIRESTORE.collection("rooms")
-    if any(collection.limit(1).stream()):
-        return
     defaults = [
         (1, "Phòng học A101", 8, [], 40000),
         (2, "Phòng thảo luận B204", 6, [], 35000),
@@ -196,34 +201,59 @@ def seed_firestore_rooms() -> None:
                 migrated_events = [dict(row) for row in c.execute("SELECT * FROM events").fetchall()]
         except sqlite3.Error:
             migrated_rooms = []
-    batch = FIRESTORE.batch()
+    # Seed missing rooms without replacing live Firestore configuration.
+    room_batch = FIRESTORE.batch()
+    room_writes = 0
     for raw in migrated_rooms:
+        ref = collection.document(str(raw["id"]))
+        if ref.get().exists:
+            continue
         room = dict(raw)
         room["amenities"] = sqlite_room(raw).get("amenities", [])
         room.setdefault("speaker_on", 0)
         for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
             room[key] = bool(room.get(key, key == "online"))
-        batch.set(collection.document(str(room["id"])), room)
-    if not migrated_rooms:
+        room_batch.set(ref, room)
+        room_writes += 1
+    if not migrated_rooms and not any(collection.limit(1).stream()):
         for room_id, name, capacity, amenities, rate in defaults:
-            batch.set(collection.document(str(room_id)), {
+            room_batch.set(collection.document(str(room_id)), {
                 "id": room_id, "name": name, "capacity": capacity, "amenities": amenities,
                 "hourly_rate": rate, "online": True, "occupied": False,
                 "light_on": False, "fan_on": False, "speaker_on": False,
             })
-    batch.commit()
-    for collection_name, rows in (("bookings", migrated_bookings), ("audit", migrated_audit), ("booking_events", migrated_events)):
+            room_writes += 1
+    if room_writes:
+        room_batch.commit()
+
+    # Import the local demo database once, even when Firestore already contains
+    # rooms. Stable document IDs make retries safe; existing cloud documents win.
+    migration_marker = FIRESTORE.collection("app_meta").document("sqlite_initial_upload_v1")
+    if migration_marker.get().exists:
+        return
+    imports = (("bookings", migrated_bookings), ("audit", migrated_audit), ("booking_events", migrated_events))
+    for collection_name, rows in imports:
+        collection_ref = FIRESTORE.collection(collection_name)
         chunk_size = 200 if collection_name == "bookings" else 400
         for offset in range(0, len(rows), chunk_size):
             migration_batch = FIRESTORE.batch()
+            writes = 0
             for raw in rows[offset:offset + chunk_size]:
+                document_id = str(raw.get("id") or uuid.uuid4().hex)
+                ref = collection_ref.document(document_id)
+                if ref.get().exists:
+                    continue
                 item = dict(raw)
                 item.pop("id", None)
-                migration_batch.set(FIRESTORE.collection(collection_name).document(str(raw.get("id") or uuid.uuid4().hex)), item)
+                migration_batch.set(ref, item)
+                writes += 1
                 if collection_name == "bookings" and raw.get("idempotency_key"):
                     idem_id = hashlib.sha256(raw["idempotency_key"].encode()).hexdigest()
-                    migration_batch.set(FIRESTORE.collection("idempotency").document(idem_id), {"booking_id": str(raw["id"])})
-            migration_batch.commit()
+                    migration_batch.set(FIRESTORE.collection("idempotency").document(idem_id), {"booking_id": document_id})
+                    writes += 1
+            if writes:
+                migration_batch.commit()
+    migration_marker.set({"version": 1, "uploaded_at": stamp(now()), "source": "sqlite"})
 
 
 def seed_firestore_users_and_devices() -> None:
@@ -267,6 +297,17 @@ def fs_room(room_id: int) -> Optional[dict[str, Any]]:
         return None
     room = snapshot.to_dict()
     room.setdefault("id", room_id)
+    status_snapshot = FIRESTORE.collection("room_status").document(str(room_id)).get()
+    if status_snapshot.exists:
+        status = status_snapshot.to_dict() or {}
+        room["online"] = bool(status.get("online", room.get("online", True)))
+        room["occupied"] = bool(status.get("occupied", room.get("occupied", False)))
+        device_states = status.get("devices", {})
+        for device, column in DEVICE_COLUMNS.items():
+            if device in device_states:
+                room[column] = bool(device_states[device])
+        if status.get("last_seen"):
+            room["last_seen"] = status["last_seen"]
     room["amenity_ids"], room["amenities"] = fs_room_amenities(room_id)
     for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
         room.setdefault(key, False if key != "online" else True)
@@ -276,6 +317,34 @@ def fs_room(room_id: int) -> Optional[dict[str, Any]]:
 def fs_rooms() -> list[dict[str, Any]]:
     rooms = [fs_room(int(doc.id)) for doc in FIRESTORE.collection("rooms").stream()]
     return sorted((room for room in rooms if room), key=lambda room: room["id"])
+
+
+def room_status_document(room_id: int, room: dict[str, Any]) -> dict[str, Any]:
+    online = bool(room.get("online", True))
+    occupied = bool(room.get("occupied", False))
+    devices = {device: bool(room.get(column, False)) for device, column in DEVICE_COLUMNS.items()}
+    return {
+        "room_id": room_id,
+        "state": "OFFLINE" if not online else ("OCCUPIED" if occupied else "AVAILABLE"),
+        "online": online,
+        "occupied": occupied,
+        "devices": devices,
+        "last_seen": room.get("last_seen"),
+        "updated_at": room.get("last_seen") or stamp(now()),
+    }
+
+
+def sync_firestore_room_summaries() -> None:
+    """Keep embedded amenity lists and per-room status documents available."""
+    for room in fs_rooms():
+        room_id = int(room["id"])
+        FIRESTORE.collection("rooms").document(str(room_id)).set({
+            "amenity_ids": room.get("amenity_ids", []),
+            "amenities": room.get("amenities", []),
+        }, merge=True)
+        status_ref = FIRESTORE.collection("room_status").document(str(room_id))
+        if not status_ref.get().exists:
+            status_ref.set(room_status_document(room_id, room))
 
 
 def amenity_key(name: str) -> str:
@@ -303,10 +372,32 @@ def migrate_firestore_amenities() -> None:
     for room_doc in FIRESTORE.collection("rooms").stream():
         for key in ROOM_AMENITIES:
             FIRESTORE.collection("room_amenities").document("%s_%s" % (room_doc.id, key)).set({"room_id": int(room_doc.id), "amenity_id": key})
-        room = room_doc.to_dict() or {}
-        if "amenities" in room:
-            room_doc.reference.update({"amenities": firestore.DELETE_FIELD})
     marker.set({"version": 2, "migrated_at": stamp(now())})
+
+
+def assign_all_amenities_to_rooms_once() -> None:
+    """Give each existing room all three selectable amenities on this upgrade only."""
+    marker = FIRESTORE.collection("app_meta").document("all_rooms_have_all_amenities_v1")
+    if marker.get().exists:
+        return
+    catalog = [key for key in ROOM_AMENITIES if FIRESTORE.collection("amenities").document(key).get().exists]
+    batch = FIRESTORE.batch()
+    writes = 0
+    for room in FIRESTORE.collection("rooms").stream():
+        try:
+            room_id = int(room.id)
+        except (TypeError, ValueError):
+            continue
+        for amenity_id in catalog:
+            ref = FIRESTORE.collection("room_amenities").document("%s_%s" % (room.id, amenity_id))
+            batch.set(ref, {"room_id": room_id, "amenity_id": amenity_id})
+            writes += 1
+            if writes == 450:
+                batch.commit()
+                batch = FIRESTORE.batch()
+                writes = 0
+    batch.set(marker, {"version": 1, "migrated_at": stamp(now())})
+    batch.commit()
 
 
 def fs_room_amenities(room_id: int) -> tuple[list[str], list[str]]:
@@ -377,13 +468,19 @@ def fs_add_event(booking_id: str, event: str, detail: str) -> None:
 
 def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
     ref = FIRESTORE.collection("rooms").document(str(room_id))
-    if not ref.get().exists:
+    snapshot = ref.get()
+    if not snapshot.exists:
         return False
-    ref.update(updates)
+    room = snapshot.to_dict() or {}
+    room.update(updates)
+    batch = FIRESTORE.batch()
+    batch.set(ref, updates, merge=True)
+    batch.set(FIRESTORE.collection("room_status").document(str(room_id)), room_status_document(room_id, room), merge=True)
     device_updates = {device: updates[column] for device, column in DEVICE_COLUMNS.items() if column in updates}
     if device_updates:
         for device, value in device_updates.items():
-            FIRESTORE.collection("devices").document("%s_%s" % (room_id, device)).set({"on": bool(value)}, merge=True)
+            batch.set(FIRESTORE.collection("devices").document("%s_%s" % (room_id, device)), {"on": bool(value)}, merge=True)
+    batch.commit()
     return True
 
 
@@ -404,6 +501,9 @@ def transition_firestore_booking(booking_id: str, expected: str, target: str) ->
         transaction.update(booking_ref, {"status": target})
         if target == "COMPLETED" and room_snapshot is not None and room_snapshot.exists:
             transaction.update(room_ref, {"occupied": False})
+            room_state = room_snapshot.to_dict() or {}
+            room_state["occupied"] = False
+            transaction.set(FIRESTORE.collection("room_status").document(str(booking["room_id"])), room_status_document(int(booking["room_id"]), room_state), merge=True)
         event_ref = FIRESTORE.collection("booking_events").document()
         transaction.set(event_ref, {"booking_id": booking_id, "event": target, "at": stamp(now()), "detail": "Tự động chuyển trạng thái theo thời gian booking"})
         audit_ref = FIRESTORE.collection("audit").document()
@@ -807,15 +907,53 @@ def free_rooms(start: datetime, end: datetime, people: int, amenities: Optional[
         return result
 
 
+def _base36(value: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value == 0:
+        return "0"
+    output = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        output = alphabet[remainder] + output
+    return output
+
+
 def sign_payload(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
-    sig = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()
-    return body + "." + sig
+    """Create a compact, signed QR token (v2); it is signed, not encrypted."""
+    booking_id = str(payload["booking_id"])
+    try:
+        booking_bytes = b"u" + uuid.UUID(booking_id).bytes
+    except ValueError:
+        booking_bytes = b"s" + booking_id.encode()
+    booking_ref = base64.urlsafe_b64encode(booking_bytes).decode().rstrip("=")
+    expiration = int(parse_dt(str(payload["exp"])).timestamp())
+    body = f"v2.{booking_ref}.{_base36(expiration)}"
+    signature = hmac.new(SECRET, body.encode(), hashlib.sha256).digest()[:12]
+    mac = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    return f"{body}.{mac}"
 
 
 def decode_token(token: str) -> dict[str, Any]:
     try:
+        parts = token.split(".")
+        if len(parts) == 4 and parts[0] == "v2":
+            _, booking_ref, expiration36, supplied_mac = parts
+            body = ".".join(parts[:3])
+            expected_mac = hmac.new(SECRET, body.encode(), hashlib.sha256).digest()[:12]
+            supplied = base64.urlsafe_b64decode(supplied_mac + "=" * (-len(supplied_mac) % 4))
+            if not hmac.compare_digest(supplied, expected_mac):
+                raise ValueError("signature")
+            booking_bytes = base64.urlsafe_b64decode(booking_ref + "=" * (-len(booking_ref) % 4))
+            if booking_bytes[:1] == b"u":
+                booking_id = str(uuid.UUID(bytes=booking_bytes[1:]))
+            elif booking_bytes[:1] == b"s":
+                booking_id = booking_bytes[1:].decode()
+            else:
+                raise ValueError("booking id")
+            expiration = int(expiration36, 36)
+            return {"booking_id": booking_id, "exp": datetime.fromtimestamp(expiration, timezone.utc).isoformat()}
+
+        # Accept QR tokens generated before compact v2 so already downloaded codes still work.
         body, signature = token.split(".", 1)
         expected = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature, expected):
@@ -947,6 +1085,10 @@ def assign_room_amenities(room_id: int, values: dict[str, Any], identity: dict[s
             batch.delete(doc.reference)
         for aid in ids:
             batch.set(collection.document("%s_%s" % (room_id, aid)), {"room_id": room_id, "amenity_id": aid})
+        batch.set(FIRESTORE.collection("rooms").document(str(room_id)), {
+            "amenity_ids": ids,
+            "amenities": [catalog[aid]["name"] for aid in ids if catalog[aid].get("enabled", True)],
+        }, merge=True)
         batch.commit()
         fs_add_audit("admin", "ROOM_AMENITIES_UPDATED", "room=%s; amenities=%s" % (room_id, ",".join(ids)))
     else:
@@ -1083,8 +1225,6 @@ def cancel_booking(booking_id: str, identity: dict[str, str] = Depends(current_u
 @app.post("/api/qr/validate")
 def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
     payload = decode_token(data.token)
-    if payload.get("room_id") != data.room_id:
-        raise HTTPException(403, "QR không thuộc phòng này")
     if now() > parse_dt(payload.get("exp", "")):
         raise HTTPException(403, "QR đã hết hạn")
     if FIRESTORE is not None:
@@ -1112,6 +1252,9 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
                 raise HTTPException(404, "Không tìm thấy phòng")
             transaction.update(booking_ref, {"status": "CHECKED_IN"})
             transaction.update(room_ref, {"occupied": True})
+            room_state = room_snapshot.to_dict() or {}
+            room_state["occupied"] = True
+            transaction.set(FIRESTORE.collection("room_status").document(str(data.room_id)), room_status_document(data.room_id, room_state), merge=True)
             event_ref = FIRESTORE.collection("booking_events").document()
             transaction.set(event_ref, {"booking_id": row["id"], "event": "CHECKED_IN", "at": stamp(now()), "detail": "QR hợp lệ; gửi lệnh bật đèn, quạt, loa"})
             audit_ref = FIRESTORE.collection("audit").document()
@@ -1295,7 +1438,7 @@ def groq_chat_reply(message: str, identity: dict[str, str], session_id: str) -> 
     return answer
 
 
-def groq_translate_chat_reply(user_message: str, reply: str) -> Optional[str]:
+def groq_translate_chat_reply(user_message: str, reply: str, target_language: str = "English") -> Optional[str]:
     """Translate a local canned response into the language used by the user."""
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -1306,7 +1449,8 @@ def groq_translate_chat_reply(user_message: str, reply: str) -> Optional[str]:
             {
                 "role": "system",
                 "content": (
-                    "Translate the assistant reply into the main language used in the user's message. "
+                    f"Translate the assistant reply into {target_language}. The target language is explicit; "
+                    "do not infer it from short replies, numbers, dates, or time expressions. "
                     "Translate only; do not answer the user or add information. Preserve every number, date, time, price, "
                     "booking ID, room code, and proper name exactly. Output only the translated reply."
                 ),
@@ -1418,27 +1562,37 @@ def _logged_chat_reply(payload: dict, source: str = "local") -> dict:
     model = f" model={GROQ_MODEL}" if source == "groq" else ""
     print(f"CHAT_REPLY source={source}{model}", flush=True)
     user_message = CHAT_REQUEST_MESSAGE.get()
-    if source != "groq" and isinstance(payload.get("reply"), str) and user_message:
-        if not re.search(r"[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]", user_message.casefold()) and not re.search(
-            r"\b(tôi|mình|minh|toi|phòng|phong|đặt|dat|cần|can|muốn|muon|ngày|ngay|giờ|gio|quạt|quat|đèn|den)\b",
-            user_message.casefold(),
-        ):
-            try:
-                translated = groq_translate_chat_reply(user_message, payload["reply"])
-                if translated:
-                    payload["reply"] = translated
-                    print("CHAT_TRANSLATION source=groq", flush=True)
-            except Exception as exc:
-                detail = ""
-                if hasattr(exc, "read"):
-                    try:
-                        detail = exc.read().decode("utf-8", errors="replace")[:300]
-                    except Exception:
-                        pass
-                print("Groq translation unavailable (%s): %s%s" % (
-                    type(exc).__name__, str(exc), ("; response=" + detail) if detail else ""
-                ), flush=True)
+    if source != "groq" and isinstance(payload.get("reply"), str) and CHAT_REPLY_LANGUAGE.get() == "en":
+        reply = payload["reply"]
+        english_fallbacks = {
+            "Chào bạn! 👋 Mình có thể giới thiệu phòng, báo giá hoặc giúp bạn tìm phòng phù hợp. Bạn muốn xem dịch vụ, loại phòng, bảng giá hay bắt đầu đặt phòng?": "Hi! 👋 I can introduce the rooms, share prices, or help you find a suitable room. Would you like to see the services, room types, prices, or start a booking?",
+            "Rất vui được hỗ trợ bạn! Nếu cần, mình có thể xem loại phòng, giá hoặc tìm phòng còn trống.": "You're welcome! I can show room types and prices or find an available room whenever you need.",
+            "Bạn cần phòng cho bao nhiêu người?": "How many people do you need the room for?",
+            "Bạn muốn đặt phòng ngày nào? Hãy ghi ngày/tháng/năm hoặc nói hôm nay/ngày mai.": "Which date would you like to book? Please enter day/month/year or say today or tomorrow.",
+            "Bạn muốn bắt đầu lúc mấy giờ? Ví dụ 14:30.": "What time would you like to start? For example, 2:30pm.",
+            "Bạn muốn sử dụng phòng trong bao lâu? Có thể chọn 1–5 phút để test, hoặc ghi 90 phút, 2 tiếng.": "How long would you like to use the room? You can say 1–5 minutes for testing, 90 minutes, or 2 hours.",
+        }
+        try:
+            translated = groq_translate_chat_reply(user_message or "", reply, "English")
+            if translated:
+                payload["reply"] = translated
+                print("CHAT_TRANSLATION source=groq target=en", flush=True)
+            elif reply in english_fallbacks:
+                payload["reply"] = english_fallbacks[reply]
+        except Exception as exc:
+            detail = ""
+            if hasattr(exc, "read"):
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:300]
+                except Exception:
+                    pass
+            print("Groq translation unavailable (%s): %s%s" % (
+                type(exc).__name__, str(exc), ("; response=" + detail) if detail else ""
+            ), flush=True)
+            if reply in english_fallbacks:
+                payload["reply"] = english_fallbacks[reply]
     CHAT_REQUEST_MESSAGE.set(None)
+    CHAT_REPLY_LANGUAGE.set("vi")
     return payload
 
 
@@ -1448,6 +1602,35 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     CHAT_REQUEST_MESSAGE.set(message)
     state = CHAT.setdefault(identity["user_id"] + ":" + data.session_id, {})
     normalized = message.casefold()
+    vietnamese_signal = bool(
+        re.search(r"[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửựỳýỷỹỵ]", normalized)
+        or re.search(r"\b(xin|chao|ban|minh|toi|phong|dat|can|muon|ngay|gio|quat|den|loa|nguoi|hom|mai|tien|ich)\b", normalized)
+    )
+    english_signal = bool(re.search(r"\b(?:i|want|need|room|people|person|guest|fan|light|lamp|speaker|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|am|pm|hour|hours|hr|hrs|min|mins|minute|minutes|recommend|suggest|which|what|please|book|thanks|hello|hi|yes|no|four|one|two|three|five|six|seven|eight|nine|ten)\b", normalized))
+    if vietnamese_signal:
+        state["language"] = "vi"
+    elif english_signal:
+        state["language"] = "en"
+    elif not state.get("language"):
+        state["language"] = "vi"
+    CHAT_REPLY_LANGUAGE.set(state.get("language", "vi"))
+    english_numbers = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20,
+    }
+    bare_english_people = re.fullmatch(
+        r"\s*(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)(?:\s+(?:people|persons|guests))?\s*",
+        normalized,
+    )
+    english_number_value = english_numbers.get(bare_english_people.group(1)) if bare_english_people else None
+    english_time_range = re.search(
+        r"\b(?:from\s*)?(?P<sh>\d{1,2})(?::(?P<sm>\d{2}))?\s*(?P<sp>am|pm)\s*(?:to|[-–])\s*(?P<eh>\d{1,2})(?::(?P<em>\d{2}))?\s*(?P<ep>am|pm)\b",
+        normalized,
+    )
+    english_single_time = re.search(r"\b(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<p>am|pm)\b", normalized)
     time_range_match = re.search(
         r"\btừ\s*(?P<from_hour>\d{1,2})(?:(?:h|:)(?P<from_min>\d{1,2})?|(?:\s*giờ))?\s*(?P<from_period>sáng|trưa|chiều|tối)?\s*(?:đến|tới|den|toi|[-–]|to)\s*(?P<to_hour>\d{1,2})(?:(?:h|:)(?P<to_min>\d{1,2})?|(?:\s*giờ))?\s*(?P<to_period>sáng|trưa|chiều|tối)?\b",
         normalized,
@@ -1488,17 +1671,34 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if detected_filter:
         room_filter = detected_filter
         state["room_filter"] = room_filter
+    else:
+        # Map casual English room labels such as "study room A" to a real
+        # room code in the database (for example A101); never invent rooms.
+        casual_room = re.search(r"\b(?:study|group|meeting|lab)\s+room\s+([a-d])\b|\broom\s+([a-d])\b", normalized)
+        if casual_room:
+            letter = next(group for group in casual_room.groups() if group)
+            matched = next((room for room in available_rooms if re.search(r"\b" + re.escape(letter) + r"\d{3}\b", room.get("name", ""), re.I)), None)
+            if matched:
+                room_filter = matched.get("name")
+                state["room_filter"] = room_filter
+                detected_filter = room_filter
 
     # Default Vietnamese booking patterns below continue to use deterministic
     # local parsing. Send less structured / natural-language room requests to
     # Groq for slot extraction, then keep availability and confirmation local.
     natural_booking_hint = bool(
         re.search(r"\b(?:i\s+)?(?:want|need|book|reserve|find|get|looking\s+for)\b.{0,120}\broom\b", normalized)
+        or re.search(r"\b(?:could\s+you\s+)?(?:find|book|reserve)\b.{0,120}\broom\b", normalized)
         or re.search(r"\broom\b.{0,100}\b(?:for\s+\w+\s+(?:people|persons|guests)|from\s+\d|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", normalized)
         or re.search(r"\b(?:mình|tôi|em|anh|chị)?\s*(?:muốn|cần|đặt|tìm|thuê)\b.{0,120}\bphòng\b", normalized)
     )
     groq_booking_slots = None
     if natural_booking_hint:
+        # Keep the deterministic multi-turn booking flow active even if Groq's
+        # extractor misses the intent on the opening message. Later replies
+        # such as "four", "21/10", or "2pm to 4pm" are booking slots, not new
+        # free-form questions for the general chat model.
+        state["local_booking_flow"] = True
         if not os.getenv("GROQ_API_KEY", "").strip():
             return _logged_chat_reply({"reply": "Để hiểu yêu cầu đặt phòng tự nhiên này, app cần GROQ_API_KEY. Hãy cấu hình key rồi khởi động lại server."})
         try:
@@ -1565,7 +1765,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                     if end_minutes <= start_minutes:
                         end_minutes += 24 * 60
                     duration_value = end_minutes - start_minutes
-                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and 15 <= duration_value <= 12 * 60:
+                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and 1 <= duration_value <= 12 * 60:
                     state["duration_minutes"] = duration_value
             aliases_to_names = {
                 "đèn": "Đèn", "den": "Đèn", "lamp": "Đèn", "light": "Đèn", "lights": "Đèn",
@@ -1645,6 +1845,12 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             rows = [sqlite_room(row) for row in c.execute("SELECT * FROM rooms ORDER BY capacity").fetchall()]
         descriptions = [f"• {r['name']}: tối đa {r['capacity']} người; có {', '.join(r.get('amenities', [])) or 'thiết bị chưa cấu hình'}; {r['hourly_rate']:,}₫/giờ" for r in rows]
         return _logged_chat_reply({"reply": "Hiện có các phòng sau (thông tin lấy từ hệ thống):\n" + "\n".join(descriptions) + "\nBạn muốn đặt phòng nào? Hãy cho mình biết số người, ngày, giờ bắt đầu và thời lượng."})
+    recommendation_request = bool(re.search(r"\b(?:recommend(?:ed|ation)?|suggest|best room|which room|what room|which one|which)\b|(?:phòng nào.*(?:nên|hợp)|gợi ý.*phòng|đề xuất.*phòng)", normalized))
+    if recommendation_request and not detected_filter:
+        # A general recommendation request means compare all matching rooms,
+        # even if an earlier AI turn guessed a particular room name.
+        room_filter = None
+        state.pop("room_filter", None)
     # Known answers and slot-based booking stay local. Groq generates answers
     # only for unrecognized free-form questions.
     has_booking_slot = bool(
@@ -1652,11 +1858,17 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or re.search(r"\b(?:hôm nay|hom nay|ngày mai|ngay mai|mai|ngày kia|ngay kia|mốt|mot|20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-]20\d{2})?|thứ\s*[2-7]|chủ nhật)\b", normalized)
         or re.search(r"\b\d{1,2}\s*(?:h|:)\s*\d{0,2}\b", normalized)
         or time_range_match
-        or re.search(r"\d+(?:[.,]\d+)?\s*(?:tiếng|giờ|hours|phút|phut|min|minutes)", normalized)
+        or re.search(r"\d+(?:[.,]\d+)?\s*(?:tiếng|giờ|hours?|hrs?|phút|phut|minutes?|mins?|min)\b", normalized)
+        or (state.get("local_booking_flow") and english_number_value is not None)
+        or (state.get("local_booking_flow") and english_time_range)
+        or (state.get("local_booking_flow") and english_single_time)
+        or (state.get("local_booking_flow") and re.search(r"\b(?:(?:this|next)\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow)\b", normalized))
+        or (state.get("local_booking_flow") and any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases))
         or (groq_booking_slots and str(groq_booking_slots.get("intent", "")).casefold() == "book_room")
     )
+    date_reference = bool(re.search(r"\b(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-](?:20)?\d{2})?)\b", normalized))
     is_general_question = bool(
-        re.search(r"(?<!\w)\d+(?:[.,]\d+)?\s*(?:\+|-|\*|/|×|÷)\s*\d+(?:[.,]\d+)?(?!\w)", normalized)
+        (re.search(r"(?<!\w)\d+(?:[.,]\d+)?\s*(?:\+|-|\*|/|×|÷)\s*\d+(?:[.,]\d+)?(?!\w)", normalized) and not date_reference)
         or re.search(r"\b(?:bằng mấy|bằng bao nhiêu|là ai|là gì|tại sao|vì sao|giới thiệu bản thân|giải thích|tính giúp|tính toán)\b", normalized)
     )
     is_booking_reply = bool(
@@ -1665,6 +1877,9 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or detected_filter
         or any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases)
         or re.fullmatch(r"\s*(?:ok|okay|được|dạ|vâng|ừ|rồi|yes|no)\s*[!.]*\s*", normalized)
+        or (state.get("local_booking_flow") and english_number_value is not None)
+        or (state.get("local_booking_flow") and (english_time_range or english_single_time))
+        or (state.get("local_booking_flow") and recommendation_request)
     )
     should_ask_groq = (is_general_question or not has_booking_slot) and (
         not state.get("local_booking_flow") or is_general_question or not is_booking_reply
@@ -1698,6 +1913,8 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         people_match = re.fullmatch(r"\s*(\d{1,2})\s*", normalized)
     if people_match:
         state["people"] = int(people_match.group(1))
+    elif state.get("local_booking_flow") and not state.get("people") and english_number_value is not None:
+        state["people"] = english_number_value
 
     local_today = now().astimezone().date()
     requested_date = None
@@ -1712,6 +1929,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         short_dmy_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?![/-]\d{2,4})\b", normalized)
         vn_match = re.search(r"ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})(?:\s+năm\s+(20\d{2}))?", normalized)
         weekday_match = re.search(r"\b(thứ\s*([2-7])|chủ nhật)\b", normalized)
+        english_weekday_match = re.search(r"\b(?:(this|next)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", normalized)
         try:
             if iso_match:
                 requested_date = date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
@@ -1725,6 +1943,16 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                 target_weekday = 6 if weekday_match.group(1) == "chủ nhật" else int(weekday_match.group(2)) - 2
                 offset = (target_weekday - local_today.weekday()) % 7 or 7
                 requested_date = local_today + timedelta(days=offset)
+            elif english_weekday_match:
+                target_weekday = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}[english_weekday_match.group(2)]
+                offset = (target_weekday - local_today.weekday()) % 7
+                if english_weekday_match.group(1) == "next":
+                    offset += 7
+                requested_date = local_today + timedelta(days=offset)
+            elif re.search(r"\btoday\b", normalized):
+                requested_date = local_today
+            elif re.search(r"\btomorrow\b", normalized):
+                requested_date = local_today + timedelta(days=1)
         except ValueError:
             return _logged_chat_reply({"reply": "Ngày bạn nhập không hợp lệ. Hãy ghi ngày/tháng/năm, ví dụ 05/10/2026.", "needs": ["date"]})
     if requested_date:
@@ -1756,10 +1984,29 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         if end_minutes <= start_minutes:
             end_minutes += 24 * 60
         duration_minutes = end_minutes - start_minutes
-        if duration_minutes < 15 or duration_minutes > 12 * 60:
-            return _logged_chat_reply({"reply": "Thời lượng tính từ khoảng giờ phải từ 15 phút đến 12 tiếng. Hãy gửi lại giờ bắt đầu và giờ kết thúc.", "needs": ["time", "duration"]})
+        if duration_minutes < 1 or duration_minutes > 12 * 60:
+            return _logged_chat_reply({"reply": "Thời lượng tính từ khoảng giờ phải từ 1 phút đến 12 tiếng. Hãy gửi lại giờ bắt đầu và giờ kết thúc.", "needs": ["time", "duration"]})
         state["time"] = f"{start_minutes // 60 % 24:02d}:{start_minutes % 60:02d}"
         state["duration_minutes"] = duration_minutes
+
+    if english_time_range:
+        def english_clock_minutes(hour_text: str, minute_text: Optional[str], period: str) -> int:
+            hour = int(hour_text)
+            minute = int(minute_text or 0)
+            if not 1 <= hour <= 12 or minute > 59:
+                raise ValueError("invalid time")
+            hour = hour % 12 + (12 if period == "pm" else 0)
+            return hour * 60 + minute
+
+        try:
+            start_minutes = english_clock_minutes(english_time_range.group("sh"), english_time_range.group("sm"), english_time_range.group("sp"))
+            end_minutes = english_clock_minutes(english_time_range.group("eh"), english_time_range.group("em"), english_time_range.group("ep"))
+        except ValueError:
+            return _logged_chat_reply({"reply": "That time range is invalid. Please use a time such as 2pm to 4pm.", "needs": ["time"]})
+        if end_minutes <= start_minutes:
+            end_minutes += 24 * 60
+        state["time"] = f"{start_minutes // 60 % 24:02d}:{start_minutes % 60:02d}"
+        state["duration_minutes"] = end_minutes - start_minutes
 
     time_match = re.search(r"\b(?:lúc\s*)?(\d{1,2})\s*(?:h|:)(\d{2})?\b", normalized)
     if time_match:
@@ -1768,14 +2015,25 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             return _logged_chat_reply({"reply": "Giờ không hợp lệ. Hãy nhập giờ từ 00:00 đến 23:59.", "needs": ["time"]})
         state["time"] = f"{hour:02d}:{minute:02d}"
 
-    duration_match = re.search(r"(?:trong\s*)?(?:(\d+(?:[.,]\d+)?)\s*(tiếng|giờ|hours)(?:\s*(?:và\s*)?(\d+)\s*(?:phút|phut))?|(\d+)\s*(phút|phut|min|minutes))", normalized)
+    if english_single_time and state.get("local_booking_flow") and not english_time_range:
+        try:
+            hour = int(english_single_time.group("h"))
+            minute = int(english_single_time.group("m") or 0)
+            if not 1 <= hour <= 12 or minute > 59:
+                raise ValueError("invalid time")
+            hour = hour % 12 + (12 if english_single_time.group("p") == "pm" else 0)
+            state["time"] = f"{hour:02d}:{minute:02d}"
+        except ValueError:
+            return _logged_chat_reply({"reply": "That start time is invalid. Please send a time such as 2pm or 14:00.", "needs": ["time"]})
+
+    duration_match = re.search(r"(?:trong\s*)?(?:(\d+(?:[.,]\d+)?)\s*(tiếng|giờ|hours?|hrs?)(?:\s*(?:(?:và|and)\s*)?(\d+)\s*(?:phút|phut|minutes?|mins?))?|(\d+)\s*(phút|phut|minutes?|mins?|min|p)\b)", normalized)
     if duration_match and not time_range_match:
         if duration_match.group(1):
             minutes = round(float(duration_match.group(1).replace(",", ".")) * 60) + int(duration_match.group(3) or 0)
         else:
             minutes = int(duration_match.group(4))
-        if minutes < 15 or minutes > 12 * 60:
-            return _logged_chat_reply({"reply": "Thời lượng đặt phòng phải từ 15 phút đến 12 tiếng. Bạn muốn dùng phòng bao lâu?", "needs": ["duration"]})
+        if minutes < 1 or minutes > 12 * 60:
+            return _logged_chat_reply({"reply": "Thời lượng đặt phòng phải từ 1 phút đến 12 tiếng. Bạn muốn dùng phòng bao lâu?", "needs": ["duration"]})
         state["duration_minutes"] = minutes
 
     if not state.get("people"):
@@ -1785,7 +2043,10 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if not state.get("time"):
         return _logged_chat_reply({"reply": "Bạn muốn bắt đầu lúc mấy giờ? Ví dụ 14:30.", "needs": ["time"]})
     if not state.get("duration_minutes"):
-        return _logged_chat_reply({"reply": "Bạn muốn sử dụng phòng trong bao lâu? Ví dụ 90 phút, 2 tiếng hoặc 2 tiếng 30 phút.", "needs": ["duration"]})
+        reply = ("How long would you like to use the room? You can say 1–5 minutes for testing, 90 minutes, or 2 hours."
+                 if state.get("language") == "en" else
+                 "Bạn muốn sử dụng phòng trong bao lâu? Có thể chọn 1–5 phút để test, hoặc ghi 90 phút, 2 tiếng.")
+        return _logged_chat_reply({"reply": reply, "needs": ["duration"]})
     start_local = datetime.combine(date.fromisoformat(state["date"]), datetime.strptime(state["time"], "%H:%M").time()).astimezone()
     if start_local <= now().astimezone():
         state.pop("time", None); state.pop("start", None); state.pop("end", None); state.pop("pending_confirm", None)
@@ -1828,6 +2089,37 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             booked_names = ", ".join(room.get("name", "Phòng") for room in matching_rooms)
             reason = f"Có {len(matching_rooms)} phòng đáp ứng sức chứa và tiện ích ({booked_names}), nhưng tất cả đã có booking trùng khung {period_start}–{period_end}. Hãy đổi ngày/giờ hoặc bỏ bớt tiện ích để tìm thêm lựa chọn."
         return _logged_chat_reply({"reply": reason, "rooms": []})
+    # After all constraints are collected, show every available room that fits.
+    # A specific room code/name turns this into the single-room confirmation path.
+    if not room_filter:
+        choices.sort(key=lambda item: (int(item.get("hourly_rate", 0)), int(item.get("capacity", 0))))
+        duration_hours = (state["end"] - state["start"]).total_seconds() / 3600
+        state["room_options"] = [item["id"] for item in choices]
+        state.pop("pending_confirm", None)
+        if state.get("language") == "en":
+            lines = [
+                f"• {item['name']} — up to {item['capacity']} people; "
+                f"amenities: {', '.join(item.get('amenities') or []) or 'none listed'}; "
+                f"{int(item.get('hourly_rate', 0)):,} VND/hour ({round(item.get('hourly_rate', 0) * duration_hours):,} VND for this booking)"
+                for item in choices
+            ]
+            reply = (f"I found {len(choices)} available room(s) for {state['people']} people on "
+                     f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
+                     f"{state['end'].astimezone():%H:%M}, with {', '.join(state.get('amenities', [])) or 'no required amenities'}:\n"
+                     + "\n".join(lines) + "\nReply with a room code (for example, D102) to continue.")
+        else:
+            lines = [
+                f"• {item['name']} — tối đa {item['capacity']} người; "
+                f"tiện ích: {', '.join(item.get('amenities') or []) or 'chưa cấu hình'}; "
+                f"{int(item.get('hourly_rate', 0)):,}₫/giờ (ước tính {round(item.get('hourly_rate', 0) * duration_hours):,}₫ cho lượt này)"
+                for item in choices
+            ]
+            reply = (f"Có {len(choices)} phòng còn trống cho {state['people']} người ngày "
+                     f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
+                     f"{state['end'].astimezone():%H:%M}, với tiện ích {', '.join(state.get('amenities', [])) or 'không yêu cầu'}:\n"
+                     + "\n".join(lines) + "\nBạn nhắn mã phòng (ví dụ D102) để tiếp tục nhé.")
+        return _logged_chat_reply({"reply": reply, "rooms": choices, "needs": ["room"]})
+
     room = choices[0]
     duration_hours = (state["end"] - state["start"]).total_seconds() / 3600
     state.update({"room_id": room["id"], "cost": round(room["hourly_rate"] * duration_hours)})
@@ -1836,10 +2128,17 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         state.pop("pending_confirm", None)
     state["context_signature"] = signature
     start_local, end_local = state["start"].astimezone(), state["end"].astimezone()
-    summary = (f"{room['name']} cho {state['people']} người, ngày {start_local:%d/%m/%Y}, {start_local:%H:%M}–{end_local:%H:%M} "
-               f"dự kiến {state['cost']:,}₫. Phòng đủ sức chứa, còn trống và có giá thấp nhất trong các lựa chọn.")
-    if state.get("amenities"):
-        summary += " Đáp ứng tiện nghi: " + ", ".join(state["amenities"]) + "."
+    if state.get("language") == "en":
+        summary = (f"{room['name']} for {state['people']} people on {start_local:%d/%m/%Y}, "
+                   f"{start_local:%H:%M}–{end_local:%H:%M}; estimated total {state['cost']:,} VND. "
+                   "The room has enough capacity and is available.")
+        if state.get("amenities"):
+            summary += " Requested amenities: " + ", ".join(state["amenities"]) + "."
+    else:
+        summary = (f"{room['name']} cho {state['people']} người, ngày {start_local:%d/%m/%Y}, {start_local:%H:%M}–{end_local:%H:%M} "
+                   f"dự kiến {state['cost']:,}₫. Phòng đủ sức chứa và còn trống.")
+        if state.get("amenities"):
+            summary += " Đáp ứng tiện nghi: " + ", ".join(state["amenities"]) + "."
     if re.search(r"\b(xác nhận|đồng ý|đặt phòng|confirm)\b", message, re.I):
         if state.get("pending_confirm"):
             try:
@@ -1848,12 +2147,22 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                 booking = create_booking(BookingIn(room_id=room["id"], start=state["start"], end=state["end"], people=state["people"], amenity_ids=amenity_ids, idempotency_key="chat-" + uuid.uuid4().hex), identity)
             except HTTPException as exc:
                 return _logged_chat_reply({"reply": "Không thể tạo booking: " + str(exc.detail), "rooms": choices})
+            reply_language = state.get("language", "vi")
             state.clear()
-            return _logged_chat_reply({"reply": "Đã tạo booking " + booking["id"][:8] + ". Trạng thái CONFIRMED.", "booking": booking})
+            message = ("Booking " + booking["id"][:8] + " created. Status: CONFIRMED."
+                       if reply_language == "en" else
+                       "Đã tạo booking " + booking["id"][:8] + ". Trạng thái CONFIRMED.")
+            return _logged_chat_reply({"reply": message, "booking": booking})
         state["pending_confirm"] = True
-        return _logged_chat_reply({"reply": "Trước khi đặt, hãy xác nhận đề xuất: " + summary + " Nhắn ‘xác nhận’ để tiếp tục.", "rooms": choices})
+        prompt = ("Please confirm this booking: " + summary + " Reply ‘confirm’ to continue."
+                  if state.get("language") == "en" else
+                  "Trước khi đặt, hãy xác nhận đề xuất: " + summary + " Nhắn ‘xác nhận’ để tiếp tục.")
+        return _logged_chat_reply({"reply": prompt, "rooms": choices})
     state["pending_confirm"] = True
-    return _logged_chat_reply({"reply": "Đề xuất: " + summary + " Nếu phù hợp, nhắn ‘xác nhận’ để đặt.", "rooms": choices})
+    proposal = ("Booking proposal: " + summary + " Reply ‘confirm’ to place the booking."
+                if state.get("language") == "en" else
+                "Đề xuất: " + summary + " Nếu phù hợp, nhắn ‘xác nhận’ để đặt.")
+    return _logged_chat_reply({"reply": proposal, "rooms": choices})
 @app.get("/api/admin/audit")
 def get_audit(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
