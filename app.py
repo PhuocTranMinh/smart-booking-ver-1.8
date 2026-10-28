@@ -2052,7 +2052,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or (state.get("local_booking_flow") and english_number_value is not None)
         or (state.get("local_booking_flow") and english_time_range)
         or (state.get("local_booking_flow") and english_single_time)
-        or (state.get("awaiting_amenities") and skip_amenities)
+        or (state.get("local_booking_flow") and skip_amenities)
         or (state.get("local_booking_flow") and re.search(r"\b(?:(?:this|next)\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow)\b", normalized))
         or (state.get("local_booking_flow") and any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases))
         or (groq_booking_slots and str(groq_booking_slots.get("intent", "")).casefold() == "book_room")
@@ -2064,10 +2064,10 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     )
     is_booking_reply = bool(
         re.fullmatch(r"\s*\d{1,2}\s*(?:(?:người|nguoi|pax))?\s*", normalized)
-        or re.search(r"\b(?:xác nhận|đồng ý|confirm|đặt phòng|hủy|huy|bắt đầu đặt phòng|tìm phòng|đổi giờ|đổi ngày)\b", normalized)
+        or re.search(r"\b(?:xác nhận|đồng ý|confirm|đặt phòng|booking|book it|make the booking|go ahead|yeah|yep|hủy|huy|bắt đầu đặt phòng|tìm phòng|đổi giờ|đổi ngày)\b", normalized)
         or detected_filter
         or any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases)
-        or (state.get("awaiting_amenities") and skip_amenities)
+        or (state.get("local_booking_flow") and skip_amenities)
         or re.fullmatch(r"\s*(?:ok|okay|được|dạ|vâng|ừ|rồi|yes|no)\s*[!.]*\s*", normalized)
         or (state.get("local_booking_flow") and english_number_value is not None)
         or (state.get("local_booking_flow") and (english_time_range or english_single_time))
@@ -2338,7 +2338,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                    f"dự kiến {state['cost']:,}₫. Phòng đủ sức chứa và còn trống.")
         if state.get("amenities"):
             summary += " Đáp ứng tiện nghi: " + ", ".join(state["amenities"]) + "."
-    if re.search(r"\b(xác nhận|đồng ý|đặt phòng|confirm)\b", message, re.I):
+    if re.search(r"\b(xác nhận|đồng ý|đặt phòng|confirm|yes|yeah|yep|booking|book it|make the booking|go ahead)\b", message, re.I):
         if state.get("pending_confirm"):
             try:
                 selected_amenities = {str(value).casefold() for value in state.get("amenities", [])}
