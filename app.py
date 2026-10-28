@@ -1792,11 +1792,19 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         normalized,
     )
     english_number_value = english_numbers.get(bare_english_people.group(1)) if bare_english_people else None
+    # Accept common chat spellings: 8am, 8 am, 8a.m, 8 a.m., and ranges.
+    # Users often type these without spaces or with periods on mobile keyboards.
+    english_period = r"(?:a\s*\.?\s*m\.?|p\s*\.?\s*m\.?)"
     english_time_range = re.search(
-        r"\b(?:from\s*)?(?P<sh>\d{1,2})(?::(?P<sm>\d{2}))?\s*(?P<sp>am|pm)\s*(?:to|[-–])\s*(?P<eh>\d{1,2})(?::(?P<em>\d{2}))?\s*(?P<ep>am|pm)\b",
+        rf"\b(?:from\s*)?(?P<sh>\d{{1,2}})(?::(?P<sm>\d{{2}}))?\s*(?P<sp>{english_period})\s*(?:to|[-–])\s*(?P<eh>\d{{1,2}})(?::(?P<em>\d{{2}}))?\s*(?P<ep>{english_period})(?!\w)",
         normalized,
     )
-    english_single_time = re.search(r"\b(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<p>am|pm)\b", normalized)
+    english_single_time = re.search(
+        rf"\b(?P<h>\d{{1,2}})(?::(?P<m>\d{{2}}))?\s*(?P<p>{english_period})(?!\w)", normalized
+    )
+
+    def normalize_english_period(value: str) -> str:
+        return "pm" if value.casefold().startswith("p") else "am"
     time_range_match = re.search(
         r"\btừ\s*(?P<from_hour>\d{1,2})(?:(?:h|:)(?P<from_min>\d{1,2})?|(?:\s*giờ))?\s*(?P<from_period>sáng|trưa|chiều|tối)?\s*(?:đến|tới|den|toi|[-–]|to)\s*(?P<to_hour>\d{1,2})(?:(?:h|:)(?P<to_min>\d{1,2})?|(?:\s*giờ))?\s*(?P<to_period>sáng|trưa|chiều|tối)?\b",
         normalized,
@@ -2064,6 +2072,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or (state.get("local_booking_flow") and english_number_value is not None)
         or (state.get("local_booking_flow") and (english_time_range or english_single_time))
         or (state.get("local_booking_flow") and recommendation_request)
+        or (state.get("local_booking_flow") and re.search(r"\b(?:i already told you|i already tell you|i told you|as i said|that is what i said|you already asked|đã nói rồi|mình nói rồi|tôi nói rồi)\b", normalized))
     )
     should_ask_groq = (is_general_question or not has_booking_slot) and (
         not state.get("local_booking_flow") or is_general_question or not is_booking_reply
@@ -2183,8 +2192,8 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             return hour * 60 + minute
 
         try:
-            start_minutes = english_clock_minutes(english_time_range.group("sh"), english_time_range.group("sm"), english_time_range.group("sp"))
-            end_minutes = english_clock_minutes(english_time_range.group("eh"), english_time_range.group("em"), english_time_range.group("ep"))
+            start_minutes = english_clock_minutes(english_time_range.group("sh"), english_time_range.group("sm"), normalize_english_period(english_time_range.group("sp")))
+            end_minutes = english_clock_minutes(english_time_range.group("eh"), english_time_range.group("em"), normalize_english_period(english_time_range.group("ep")))
         except ValueError:
             return _logged_chat_reply({"reply": "That time range is invalid. Please use a time such as 2pm to 4pm.", "needs": ["time"]})
         if end_minutes <= start_minutes:
@@ -2205,7 +2214,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             minute = int(english_single_time.group("m") or 0)
             if not 1 <= hour <= 12 or minute > 59:
                 raise ValueError("invalid time")
-            hour = hour % 12 + (12 if english_single_time.group("p") == "pm" else 0)
+            hour = hour % 12 + (12 if normalize_english_period(english_single_time.group("p")) == "pm" else 0)
             state["time"] = f"{hour:02d}:{minute:02d}"
         except ValueError:
             return _logged_chat_reply({"reply": "That start time is invalid. Please send a time such as 2pm or 14:00.", "needs": ["time"]})
