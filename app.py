@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import contextvars
 import hashlib
 import hmac
@@ -11,6 +12,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -19,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -31,9 +33,11 @@ except ImportError:
 try:
     from google.cloud import firestore
     from google.oauth2 import service_account
+    from google.api_core.exceptions import ResourceExhausted
 except ImportError:
     firestore = None
     service_account = None
+    ResourceExhausted = None
 
 BASE = Path(__file__).parent
 DB_PATH = Path(os.getenv("ROOM_DB", str(BASE / "rooms.db")))
@@ -48,6 +52,15 @@ MQTT_CLIENT = None
 MQTT_CONNECTED = False
 FIRESTORE = None
 FIRESTORE_BOOTSTRAP_PENDING = False
+FS_ROOM_CACHE: Optional[list[dict[str, Any]]] = None
+FS_ROOM_CACHE_AT = 0.0
+FS_ROOM_CACHE_RETRY_AT = 0.0
+FS_ROOM_CACHE_LOCK = threading.RLock()
+FS_ROOM_CACHE_TTL = 30.0
+AMENITY_CACHE: Optional[list[dict[str, Any]]] = None
+AMENITY_CACHE_AT = 0.0
+AMENITY_CACHE_RETRY_AT = 0.0
+AMENITY_CACHE_LOCK = threading.RLock()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "smart-booking-82438")
 ROOM_AMENITIES = {
     "lamp": ("Đèn", "Điều khiển đèn trong phòng."),
@@ -58,6 +71,14 @@ LIFECYCLE_STOP = threading.Event()
 LIFECYCLE_THREAD = None
 app = FastAPI(title="Smart Study Room API", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+
+
+async def firestore_quota_error_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail": "Firestore đang hết quota đọc/ghi. Dữ liệu tạm thời chưa khả dụng; hãy thử lại sau khi quota được cấp lại."})
+
+
+if ResourceExhausted is not None:
+    app.add_exception_handler(ResourceExhausted, firestore_quota_error_handler)
 
 
 def now() -> datetime:
@@ -331,9 +352,62 @@ def fs_room(room_id: int) -> Optional[dict[str, Any]]:
     return room
 
 
+def invalidate_fs_room_cache() -> None:
+    global FS_ROOM_CACHE, FS_ROOM_CACHE_AT, FS_ROOM_CACHE_RETRY_AT
+    with FS_ROOM_CACHE_LOCK:
+        FS_ROOM_CACHE = None
+        FS_ROOM_CACHE_AT = 0.0
+        FS_ROOM_CACHE_RETRY_AT = 0.0
+
+
+def sqlite_rooms_snapshot() -> list[dict[str, Any]]:
+    with db() as connection:
+        rows = [dict(row) for row in connection.execute("SELECT * FROM rooms ORDER BY id").fetchall()]
+    return [sqlite_room(row) for row in rows]
+
+
 def fs_rooms() -> list[dict[str, Any]]:
-    rooms = [fs_room(int(doc.id)) for doc in FIRESTORE.collection("rooms").stream()]
-    return sorted((room for room in rooms if room), key=lambda room: room["id"])
+    global FS_ROOM_CACHE, FS_ROOM_CACHE_AT, FS_ROOM_CACHE_RETRY_AT
+    current = time.monotonic()
+    with FS_ROOM_CACHE_LOCK:
+        if FS_ROOM_CACHE is not None and (current - FS_ROOM_CACHE_AT < FS_ROOM_CACHE_TTL or current < FS_ROOM_CACHE_RETRY_AT):
+            return copy.deepcopy(FS_ROOM_CACHE)
+        try:
+            room_docs = list(FIRESTORE.collection("rooms").stream())
+            status_docs = list(FIRESTORE.collection("room_status").stream())
+            status_by_room = {str(doc.id): (doc.to_dict() or {}) for doc in status_docs}
+            rooms = []
+            for doc in room_docs:
+                room = doc.to_dict() or {}
+                room_id = int(doc.id)
+                room.setdefault("id", room_id)
+                status = status_by_room.get(str(room_id), {})
+                room["online"] = bool(status.get("online", room.get("online", True)))
+                room["occupied"] = bool(status.get("occupied", room.get("occupied", False)))
+                devices = status.get("devices", {})
+                for device, column in DEVICE_COLUMNS.items():
+                    room[column] = bool(devices.get(device, room.get(column, False)))
+                if status.get("last_seen"):
+                    room["last_seen"] = status["last_seen"]
+                room["amenity_ids"] = [str(value) for value in room.get("amenity_ids", [])]
+                room["amenities"] = list(room.get("amenities", []))
+                rooms.append(room)
+            rooms.sort(key=lambda room: room["id"])
+            FS_ROOM_CACHE = rooms
+            FS_ROOM_CACHE_AT = current
+            FS_ROOM_CACHE_RETRY_AT = 0.0
+            return copy.deepcopy(rooms)
+        except Exception as exc:
+            if type(exc).__name__ != "ResourceExhausted":
+                raise
+            # Keep room discovery usable from the bundled SQLite snapshot while
+            # Firestore is throttling. Booking writes still require Firestore.
+            if FS_ROOM_CACHE is None:
+                FS_ROOM_CACHE = sqlite_rooms_snapshot()
+            FS_ROOM_CACHE_AT = current
+            FS_ROOM_CACHE_RETRY_AT = current + 300
+            print("Firestore rooms read throttled; serving local room snapshot", flush=True)
+            return copy.deepcopy(FS_ROOM_CACHE)
 
 
 def room_status_document(room_id: int, room: dict[str, Any]) -> dict[str, Any]:
@@ -451,12 +525,42 @@ def resolve_booking_amenities(room_id: int, requested_ids: list[str]) -> list[st
 
 
 def get_amenities(include_disabled: bool = False) -> list[dict[str, Any]]:
+    global AMENITY_CACHE, AMENITY_CACHE_AT, AMENITY_CACHE_RETRY_AT
     if FIRESTORE is not None:
-        items = [dict(doc.to_dict() or {}, id=doc.id) for doc in FIRESTORE.collection("amenities").stream()]
-        return sorted((x for x in items if include_disabled or x.get("enabled", True)), key=lambda x: x.get("name", "").casefold())
-    with db() as c:
-        q = "SELECT id,name,description,enabled FROM amenities" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY name COLLATE NOCASE"
-        return [dict(row) for row in c.execute(q).fetchall()]
+        current = time.monotonic()
+        with AMENITY_CACHE_LOCK:
+            if AMENITY_CACHE is not None and (current - AMENITY_CACHE_AT < 60 or current < AMENITY_CACHE_RETRY_AT):
+                items = copy.deepcopy(AMENITY_CACHE)
+            else:
+                try:
+                    items = [dict(doc.to_dict() or {}, id=doc.id) for doc in FIRESTORE.collection("amenities").stream()]
+                    AMENITY_CACHE = items
+                    AMENITY_CACHE_AT = current
+                    AMENITY_CACHE_RETRY_AT = 0.0
+                except Exception as exc:
+                    if type(exc).__name__ != "ResourceExhausted":
+                        raise
+                    if AMENITY_CACHE is not None:
+                        items = copy.deepcopy(AMENITY_CACHE)
+                    else:
+                        with db() as c:
+                            items = [dict(row) for row in c.execute("SELECT id,name,description,enabled FROM amenities ORDER BY name COLLATE NOCASE").fetchall()]
+                        AMENITY_CACHE = copy.deepcopy(items)
+                        AMENITY_CACHE_AT = current
+                    AMENITY_CACHE_RETRY_AT = current + 300
+                    print("Firestore amenities read throttled; serving local amenity snapshot", flush=True)
+    else:
+        with db() as c:
+            items = [dict(row) for row in c.execute("SELECT id,name,description,enabled FROM amenities ORDER BY name COLLATE NOCASE").fetchall()]
+    return sorted((x for x in items if include_disabled or x.get("enabled", True)), key=lambda x: x.get("name", "").casefold())
+
+
+def invalidate_amenity_cache() -> None:
+    global AMENITY_CACHE, AMENITY_CACHE_AT, AMENITY_CACHE_RETRY_AT
+    with AMENITY_CACHE_LOCK:
+        AMENITY_CACHE = None
+        AMENITY_CACHE_AT = 0.0
+        AMENITY_CACHE_RETRY_AT = 0.0
 
 
 def sqlite_room(row: Any) -> dict[str, Any]:
@@ -498,6 +602,7 @@ def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
         for device, value in device_updates.items():
             batch.set(FIRESTORE.collection("devices").document("%s_%s" % (room_id, device)), {"on": bool(value)}, merge=True)
     batch.commit()
+    invalidate_fs_room_cache()
     return True
 
 
@@ -528,6 +633,8 @@ def transition_firestore_booking(booking_id: str, expected: str, target: str) ->
         return True
 
     row_result["changed"] = transition(FIRESTORE.transaction())
+    if row_result["changed"]:
+        invalidate_fs_room_cache()
     return row_result["changed"]
 
 
@@ -1114,6 +1221,7 @@ def update_amenity(amenity_id: str, values: dict[str, Any], identity: dict[str, 
                 if not result.rowcount:
                     raise HTTPException(404, "Không tìm thấy tiện ích")
                 audit(c, "admin", "AMENITY_UPDATED", amenity_id + ": " + json.dumps(values, ensure_ascii=False))
+        invalidate_amenity_cache()
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "Tên tiện ích đã được sử dụng") from exc
     return {"ok": True, "id": amenity_id, **values}
@@ -1140,6 +1248,7 @@ def assign_room_amenities(room_id: int, values: dict[str, Any], identity: dict[s
             "amenities": [catalog[aid]["name"] for aid in ids if catalog[aid].get("enabled", True)],
         }, merge=True)
         batch.commit()
+        invalidate_fs_room_cache()
         fs_add_audit("admin", "ROOM_AMENITIES_UPDATED", "room=%s; amenities=%s" % (room_id, ",".join(ids)))
     else:
         with db() as c:
