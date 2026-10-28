@@ -1649,15 +1649,31 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         with db() as c:
             available_rooms = [sqlite_room(row) for row in c.execute("SELECT * FROM rooms").fetchall()]
     amenity_aliases = {
-        "Đèn": ("đèn", "den", "lamp"), "Quạt": ("quạt", "quat", "fan"),
-        "Loa": ("loa", "speaker"),
+        "Đèn": ("đèn", "den", "lamp", "light", "lights"), "Quạt": ("quạt", "quat", "fan", "fans"),
+        "Loa": ("loa", "speaker", "speakers"),
     }
     requested_amenities = set(state.get("amenities", []))
+    recognized_amenity = False
     for amenity, aliases in amenity_aliases.items():
         if any(alias in normalized for alias in aliases):
             requested_amenities.add(amenity)
+            recognized_amenity = True
     if requested_amenities:
         state["amenities"] = sorted(requested_amenities)
+    skip_amenities = bool(re.search(r"\b(?:none|no|skip|neither|không|khong|không cần|khong can|bỏ qua|bo qua|không dùng|khong dung|no amenities)\b", normalized))
+    if state.get("awaiting_amenities"):
+        if skip_amenities:
+            state.pop("amenities", None)
+            state.pop("awaiting_amenities", None)
+            state["amenities_step_done"] = True
+        elif recognized_amenity:
+            state.pop("awaiting_amenities", None)
+            state["amenities_step_done"] = True
+        else:
+            prompt = ("Would you like any room amenities? Reply with fan, light, speaker, or none."
+                      if state.get("language") == "en" else
+                      "Bạn muốn dùng tiện ích nào? Hãy nhắn đèn, quạt, loa hoặc ‘không cần’. ")
+            return _logged_chat_reply({"reply": prompt, "needs": ["amenities"]})
     room_aliases = {"lab": ("lab", "phòng thí nghiệm"), "thảo luận": ("thảo luận", "thao luan"),
                     "nhóm": ("phòng nhóm", "phòng cho nhóm"), "học": ("phòng học",)}
     room_filter = state.get("room_filter")
@@ -1862,6 +1878,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or (state.get("local_booking_flow") and english_number_value is not None)
         or (state.get("local_booking_flow") and english_time_range)
         or (state.get("local_booking_flow") and english_single_time)
+        or (state.get("awaiting_amenities") and skip_amenities)
         or (state.get("local_booking_flow") and re.search(r"\b(?:(?:this|next)\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow)\b", normalized))
         or (state.get("local_booking_flow") and any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases))
         or (groq_booking_slots and str(groq_booking_slots.get("intent", "")).casefold() == "book_room")
@@ -1876,6 +1893,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         or re.search(r"\b(?:xác nhận|đồng ý|confirm|đặt phòng|hủy|huy|bắt đầu đặt phòng|tìm phòng|đổi giờ|đổi ngày)\b", normalized)
         or detected_filter
         or any(alias in normalized for aliases in amenity_aliases.values() for alias in aliases)
+        or (state.get("awaiting_amenities") and skip_amenities)
         or re.fullmatch(r"\s*(?:ok|okay|được|dạ|vâng|ừ|rồi|yes|no)\s*[!.]*\s*", normalized)
         or (state.get("local_booking_flow") and english_number_value is not None)
         or (state.get("local_booking_flow") and (english_time_range or english_single_time))
@@ -2127,6 +2145,12 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if state.get("context_signature") is not None and state["context_signature"] != signature:
         state.pop("pending_confirm", None)
     state["context_signature"] = signature
+    if not state.get("amenities") and not state.get("amenities_step_done"):
+        state["awaiting_amenities"] = True
+        prompt = (f"{room['name']} is available. Would you like to add fan, light, or speaker? Reply with the amenities you want, or ‘none’ to skip."
+                  if state.get("language") == "en" else
+                  f"{room['name']} còn trống. Bạn muốn chọn thêm đèn, quạt hoặc loa không? Nhắn tiện ích muốn dùng, hoặc ‘không cần’ để bỏ qua.")
+        return _logged_chat_reply({"reply": prompt, "rooms": [room], "needs": ["amenities"]})
     start_local, end_local = state["start"].astimezone(), state["end"].astimezone()
     if state.get("language") == "en":
         summary = (f"{room['name']} for {state['people']} people on {start_local:%d/%m/%Y}, "
