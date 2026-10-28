@@ -47,6 +47,7 @@ SESSIONS: dict[str, dict[str, str]] = {}
 MQTT_CLIENT = None
 MQTT_CONNECTED = False
 FIRESTORE = None
+FIRESTORE_BOOTSTRAP_PENDING = False
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "smart-booking-82438")
 ROOM_AMENITIES = {
     "lamp": ("Đèn", "Điều khiển đèn trong phòng."),
@@ -159,7 +160,7 @@ def init_db() -> None:
 
 
 def init_firestore() -> None:
-    global FIRESTORE
+    global FIRESTORE, FIRESTORE_BOOTSTRAP_PENDING
     credentials_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if not credentials_json and not credentials_path:
@@ -173,11 +174,27 @@ def init_firestore() -> None:
         FIRESTORE = firestore.Client(project=project_id, credentials=credentials)
     else:
         FIRESTORE = firestore.Client(project=FIREBASE_PROJECT_ID)
-    seed_firestore_rooms()
-    migrate_firestore_amenities()
-    assign_all_amenities_to_rooms_once()
-    seed_firestore_users_and_devices()
-    sync_firestore_room_summaries()
+    # Bootstrap/migrations are one-time work. Previously every Render restart
+    # re-read many room, user, device, and booking documents, consuming quota.
+    marker = FIRESTORE.collection("app_meta").document("render_bootstrap_v1")
+    try:
+        if marker.get().exists:
+            FIRESTORE_BOOTSTRAP_PENDING = False
+            return
+        seed_firestore_rooms()
+        migrate_firestore_amenities()
+        assign_all_amenities_to_rooms_once()
+        seed_firestore_users_and_devices()
+        sync_firestore_room_summaries()
+        marker.set({"version": 1, "completed_at": stamp(now())})
+        FIRESTORE_BOOTSTRAP_PENDING = False
+    except Exception as exc:
+        if type(exc).__name__ != "ResourceExhausted":
+            raise
+        # Keep the web process alive while Firestore is out of quota. The
+        # database endpoints will report service unavailable until quota returns.
+        FIRESTORE_BOOTSTRAP_PENDING = True
+        print("Firestore bootstrap deferred: quota exceeded (429); web server will start", flush=True)
 
 
 def seed_firestore_rooms() -> None:
@@ -576,8 +593,17 @@ def process_booking_lifecycle() -> None:
 
 
 def lifecycle_worker() -> None:
-    interval = 60 if FIRESTORE is not None else 15
-    while not LIFECYCLE_STOP.wait(interval):
+    while True:
+        interval = 900 if FIRESTORE is not None and FIRESTORE_BOOTSTRAP_PENDING else (60 if FIRESTORE is not None else 15)
+        if LIFECYCLE_STOP.wait(interval):
+            return
+        if FIRESTORE is not None and FIRESTORE_BOOTSTRAP_PENDING:
+            try:
+                init_firestore()
+            except Exception as exc:
+                print("Firestore bootstrap retry failed %s: %s" % (type(exc).__name__, str(exc)), flush=True)
+            if FIRESTORE_BOOTSTRAP_PENDING:
+                continue
         try:
             process_booking_lifecycle()
         except Exception as exc:
@@ -1012,12 +1038,12 @@ def health():
     ai_status = {"ai_provider": "groq", "ai_enabled": bool(os.getenv("GROQ_API_KEY", "").strip()), "ai_model": GROQ_MODEL}
     if FIRESTORE is None:
         return {"status": "ok", "database": "sqlite", "firestore_connected": False, **ai_status}
-    try:
-        next(iter(FIRESTORE.collection("rooms").limit(1).stream()), None)
-        return {"status": "ok", "database": "firestore", "firestore_connected": True, **ai_status}
-    except Exception as exc:
-        print("Firestore health check failed: %s: %s" % (type(exc).__name__, str(exc)), flush=True)
-        return {"status": "degraded", "database": "firestore", "firestore_connected": False, "error": type(exc).__name__, **ai_status}
+    # Render polls this route. Do not spend one Firestore read per health ping,
+    # especially when the project has reached its daily read quota.
+    return {
+        "status": "ok", "database": "firestore", "firestore_configured": True,
+        "bootstrap_pending": FIRESTORE_BOOTSTRAP_PENDING, **ai_status,
+    }
 
 
 @app.post("/api/auth/login")
