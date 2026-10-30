@@ -1383,10 +1383,11 @@ def list_bookings(identity: dict[str, str] = Depends(current_user)):
                 print("Firestore booking list throttled: quota exceeded", flush=True)
                 raise HTTPException(503, "Firestore đang giới hạn lượt đọc. Thử tải lại sau ít phút.") from exc
             raise
-        items.sort(key=lambda booking: booking.get("created", ""), reverse=True)
+        # Sort by the booked session date, not by when the booking was created.
+        items.sort(key=lambda booking: booking.get("start", ""))
         return [booking_view(item) for item in items[:50]]
     with db() as c:
-        return [booking_view(r) for r in c.execute("SELECT * FROM bookings WHERE user_id=? ORDER BY created DESC", (identity["user_id"],)).fetchall()]
+        return [booking_view(r) for r in c.execute("SELECT * FROM bookings WHERE user_id=? ORDER BY start ASC", (identity["user_id"],)).fetchall()]
 
 
 @app.get("/api/bookings/{booking_id}")
@@ -2529,6 +2530,7 @@ def admin_bookings(identity: dict[str, str] = Depends(current_user)):
     if FIRESTORE is not None:
         rooms_by_id = {r["id"]: r["name"] for r in fs_rooms()}
         items = [dict(booking_view(b), room_name=rooms_by_id.get(b.get("room_id"), "Phòng")) for b in fs_bookings(limit=100)]
+        items.sort(key=lambda booking: booking.get("start", ""))
         return items
     with db() as c:
-        return [dict(booking_view(r), room_name=r["room_name"]) for r in c.execute("SELECT b.*,r.name room_name FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.created DESC LIMIT 100").fetchall()]
+        return [dict(booking_view(r), room_name=r["room_name"]) for r in c.execute("SELECT b.*,r.name room_name FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.start ASC LIMIT 100").fetchall()]
