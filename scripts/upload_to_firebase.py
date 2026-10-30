@@ -103,12 +103,12 @@ def read_local_data(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
         if canonical_id:
             room_links.setdefault(str(link["room_id"]), []).append(canonical_id)
 
-    output: dict[str, list[tuple[str, dict[str, Any]]]] = {name: [] for name in (
-        "users", "rooms", "amenities", "room_amenities", "devices", "bookings",
-        "idempotency", "booking_events", "audit", "app_meta", "room_status",
-    )}
-    output["users"] = list(DEMO_USERS.items())
-    amenity_label_by_id = {key: name for key, (name, _) in AMENITIES.items()}
+    output: dict[str, list[tuple[str, dict[str, Any]]]] = {name: [] for name in ("rooms", "bookings", "audit", "app_meta")}
+    catalog_items = {}
+    for amenity_id, (name, description) in AMENITIES.items():
+        raw = next((item for item in amenities if str(item.get("name", "")).casefold() == name.casefold()), {})
+        catalog_items[amenity_id] = {"name": name, "description": description, "enabled": bool(raw.get("enabled", True))}
+    output["app_meta"].append(("amenities", {"items": catalog_items}))
     for raw in rooms:
         room_id = int(raw["id"])
         room = {key: raw.get(key) for key in (
@@ -119,53 +119,31 @@ def read_local_data(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
         for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
             room[key] = bool(room.get(key, key == "online"))
         room["amenity_ids"] = sorted(set(room_links.get(str(room_id), [])))
-        room["amenities"] = [amenity_label_by_id[key] for key in room["amenity_ids"]]
+        room["device_config"] = {}
+        for device, column in DEVICE_COLUMNS.items():
+            config = next((item for item in devices if int(item["room_id"]) == room_id and item["device"] == device), {})
+            room["device_config"][device] = {"name": config.get("name") or AMENITIES[device][0], "enabled": bool(config.get("enabled", True))}
         output["rooms"].append((str(room_id), room))
-        for amenity_id in sorted(set(room_links.get(str(room_id), []))):
-            output["room_amenities"].append((f"{room_id}_{amenity_id}", {"room_id": room_id, "amenity_id": amenity_id}))
-        room_state = "OFFLINE" if not room["online"] else ("OCCUPIED" if room["occupied"] else "AVAILABLE")
-        output["room_status"].append((str(room_id), {
-            "room_id": room_id, "state": room_state, "online": room["online"],
-            "occupied": room["occupied"],
-            "devices": {device: bool(room.get(column, False)) for device, column in DEVICE_COLUMNS.items()},
-            "last_seen": room.get("last_seen"), "updated_at": room.get("last_seen"),
-        }))
-
-    for amenity_id, (name, description) in AMENITIES.items():
-        raw = next((item for item in amenities if str(item.get("name", "")).casefold() == name.casefold()), {})
-        output["amenities"].append((amenity_id, {
-            "id": amenity_id, "name": name, "description": description,
-            "enabled": bool(raw.get("enabled", True)),
-        }))
-    # Mark the normalized catalog as already migrated so app startup preserves
-    # the room-to-amenity links uploaded from SQLite instead of resetting them.
     output["app_meta"].extend([
-        ("amenity_catalog_v2", {"version": 2, "source": "sqlite_upload"}),
-        ("all_rooms_have_all_amenities_v1", {"version": 1, "source": "sqlite_upload"}),
+        ("render_bootstrap_v1", {"version": 1, "source": "sqlite_upload"}),
+        ("sqlite_initial_upload_v1", {"version": 1, "source": "sqlite_upload"}),
+        ("amenity_catalog_v4", {"version": 4, "source": "sqlite_upload"}),
+        ("all_rooms_have_all_amenities_v3", {"version": 3, "source": "sqlite_upload"}),
+        ("compact_schema_v1", {"version": 1, "source": "sqlite_upload"}),
     ])
 
-    room_by_id = {int(room["id"]): room for room in rooms}
-    local_devices = {(int(item["room_id"]), str(item["device"])): item for item in devices}
-    for room_id, room in room_by_id.items():
-        for device, column in DEVICE_COLUMNS.items():
-            config = local_devices.get((room_id, device), {})
-            output["devices"].append((f"{room_id}_{device}", {
-                "id": f"{room_id}_{device}", "room_id": room_id, "device": device,
-                "name": config.get("name") or AMENITIES[device][0],
-                "enabled": bool(config.get("enabled", True)), "on": bool(room.get(column, False)),
-                "topic_command": f"rooms/{room_id}/devices/{device}/command",
-                "topic_status": f"rooms/{room_id}/devices/{device}/status",
-            }))
-
+    events_by_booking: dict[str, list[dict[str, Any]]] = {}
+    for row in events:
+        events_by_booking.setdefault(str(row.get("booking_id", "")), []).append({
+            "event": row.get("event"), "at": row.get("at"), "detail": row.get("detail", "")
+        })
     for booking in bookings:
         booking_id = str(booking["id"])
         payload = dict(booking)
         payload.pop("id", None)
+        payload["events"] = events_by_booking.get(booking_id, [])
         output["bookings"].append((booking_id, payload))
-        if booking.get("idempotency_key"):
-            idem_id = hashlib.sha256(str(booking["idempotency_key"]).encode()).hexdigest()
-            output["idempotency"].append((idem_id, {"booking_id": booking_id}))
-    for collection, rows in (("booking_events", events), ("audit", audit)):
+    for collection, rows in (("audit", audit),):
         for row in rows:
             document_id = str(row.get("id") or hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest())
             payload = dict(row)
@@ -185,13 +163,14 @@ def upload(client, records: dict[str, list[tuple[str, dict[str, Any]]]], apply: 
         if not apply:
             continue
         if collection_name == "rooms" and not overwrite:
-            # Keep cloud-managed room settings and live state, while adding the
-            # requested embedded amenity summary to existing room documents.
+            # Keep cloud-managed settings and live state, while updating only the
+            # room's canonical amenity ID list.
             for doc_id, payload in documents:
                 if doc_id in existing_ids:
                     collection.document(doc_id).set({
                         "amenity_ids": payload.get("amenity_ids", []),
-                        "amenities": payload.get("amenities", []),
+                        "device_config": payload.get("device_config", {}),
+                        "amenities": firestore.DELETE_FIELD,
                     }, merge=True)
                     room_summaries_synced += 1
         if not new_documents:

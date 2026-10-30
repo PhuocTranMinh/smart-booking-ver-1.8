@@ -28,23 +28,28 @@ Mặc định script chỉ thêm document chưa có, nên có thể chạy lại
 
 ## Dữ liệu được tổ chức
 
-Script tải các collection theo thực thể của đề tài:
+App dùng 4 collection cốt lõi:
 
 | Collection | Nội dung |
 |---|---|
-| `users` | ID demo và vai trò; không chứa mật khẩu |
-| `rooms` | Tên, sức chứa, giá và trạng thái phòng |
-| `room_status` | Telemetry hiện thời: online/offline, occupancy, trạng thái thiết bị, thời điểm cập nhật |
-| `amenities` | Danh mục Đèn, Quạt, Loa |
-| `room_amenities` | Liên kết riêng giữa phòng và tiện ích |
-| `devices` | Thiết bị, trạng thái và topic MQTT của từng phòng |
-| `bookings` | Người đặt, phòng, thời gian, giá, trạng thái, tiện ích và hạn QR |
-| `idempotency` | Khóa chống tạo booking lặp |
-| `booking_events` | Lịch sử chuyển trạng thái booking |
+| `rooms` | Tên, sức chứa, giá, tiện ích, telemetry và cấu hình thiết bị |
+| `bookings` | Người đặt, phòng, thời gian, giá, trạng thái, tiện ích, hạn QR và lịch sử |
 | `audit` | Nhật ký thao tác quan trọng |
-| `app_meta` | Phiên bản schema/migration để app không tạo lại dữ liệu đã tải |
+| `app_meta` | Danh mục tiện ích, schema/migration và tài khoản đăng ký trong nhánh con `auth/users` |
 
-Document `rooms/{room_id}` có danh sách tiện ích để tra cứu nhanh; collection `room_amenities` giữ liên kết chuẩn cho thao tác quản trị. `room_status/{room_id}` là bản trạng thái hiện thời riêng, được đồng bộ theo telemetry, check-in và kết thúc booking. Document dùng ID ổn định lấy từ SQLite (liên kết tiện ích/thiết bị dùng dạng `room_id_amenity_id`), vì vậy upload lặp không tạo bản sao. Script ghi marker schema để app không xóa/gán lại liên kết tiện ích khi khởi động. Backend tiếp tục xử lý booking bằng Firestore transaction và cập nhật document phòng trong transaction để đồng bộ các yêu cầu cạnh tranh.
+Trước khi migrate, deploy code mới để app không còn ghi vào collection cũ. Sau đó xem trước dữ liệu cần gộp và dọn:
+
+```powershell
+.venv\Scripts\python.exe scripts\simplify_firestore.py --credentials .\firebase-service-account.json --project smart-booking-82438
+```
+
+Kiểm tra số phòng và booking. Nếu đúng, chạy migration; script sao lưu dữ liệu trước khi chuyển trạng thái/thiết bị vào phòng, lịch sử vào booking và xóa các collection cũ:
+
+```powershell
+.venv\Scripts\python.exe scripts\simplify_firestore.py --credentials .\firebase-service-account.json --project smart-booking-82438 --apply --backup .\firestore-before-compact.json
+```
+
+Sau migration, Firestore chỉ còn bốn collection cấp cao nhất: `rooms`, `bookings`, `audit`, `app_meta`. Tài khoản đăng ký được đặt trong subcollection `app_meta/auth/users`, mật khẩu được băm trước khi lưu; tài khoản mới chỉ có quyền user. Giữ JSON backup ở nơi an toàn; file có thể chứa cấu hình và lịch sử booking.
 
 ## Kết nối ứng dụng
 

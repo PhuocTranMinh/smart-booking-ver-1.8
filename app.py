@@ -142,6 +142,10 @@ def init_db() -> None:
           PRIMARY KEY(room_id, amenity_id)
         );
         CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS users (
+          username TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+          password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         """)
         columns = {row[1] for row in c.execute("PRAGMA table_info(rooms)").fetchall()}
         if "speaker_on" not in columns:
@@ -200,6 +204,12 @@ def init_firestore() -> None:
     marker = FIRESTORE.collection("app_meta").document("render_bootstrap_v1")
     try:
         if marker.get().exists:
+            compact_marker = FIRESTORE.collection("app_meta").document("compact_schema_v1")
+            if not compact_marker.get().exists:
+                migrate_firestore_amenities()
+                assign_all_amenities_to_rooms_once()
+                seed_firestore_users_and_devices()
+                compact_marker.set({"version": 1, "prepared_at": stamp(now())})
             FIRESTORE_BOOTSTRAP_PENDING = False
             return
         seed_firestore_rooms()
@@ -208,6 +218,7 @@ def init_firestore() -> None:
         seed_firestore_users_and_devices()
         sync_firestore_room_summaries()
         marker.set({"version": 1, "completed_at": stamp(now())})
+        FIRESTORE.collection("app_meta").document("compact_schema_v1").set({"version": 1, "prepared_at": stamp(now())})
         FIRESTORE_BOOTSTRAP_PENDING = False
     except Exception as exc:
         if type(exc).__name__ != "ResourceExhausted":
@@ -247,7 +258,8 @@ def seed_firestore_rooms() -> None:
         if ref.get().exists:
             continue
         room = dict(raw)
-        room["amenities"] = sqlite_room(raw).get("amenities", [])
+        room["amenity_ids"] = sqlite_room(raw).get("amenity_ids", [])
+        room.pop("amenities", None)
         room.setdefault("speaker_on", 0)
         for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
             room[key] = bool(room.get(key, key == "online"))
@@ -256,7 +268,7 @@ def seed_firestore_rooms() -> None:
     if not migrated_rooms and not any(collection.limit(1).stream()):
         for room_id, name, capacity, amenities, rate in defaults:
             room_batch.set(collection.document(str(room_id)), {
-                "id": room_id, "name": name, "capacity": capacity, "amenities": amenities,
+                "id": room_id, "name": name, "capacity": capacity, "amenity_ids": [],
                 "hourly_rate": rate, "online": True, "occupied": False,
                 "light_on": False, "fan_on": False, "speaker_on": False,
             })
@@ -269,7 +281,12 @@ def seed_firestore_rooms() -> None:
     migration_marker = FIRESTORE.collection("app_meta").document("sqlite_initial_upload_v1")
     if migration_marker.get().exists:
         return
-    imports = (("bookings", migrated_bookings), ("audit", migrated_audit), ("booking_events", migrated_events))
+    events_by_booking: dict[str, list[dict[str, Any]]] = {}
+    for event in migrated_events:
+        events_by_booking.setdefault(str(event.get("booking_id", "")), []).append({
+            "event": event.get("event", ""), "at": event.get("at", ""), "detail": event.get("detail", "")
+        })
+    imports = (("bookings", migrated_bookings), ("audit", migrated_audit))
     for collection_name, rows in imports:
         collection_ref = FIRESTORE.collection(collection_name)
         chunk_size = 200 if collection_name == "bookings" else 400
@@ -283,50 +300,33 @@ def seed_firestore_rooms() -> None:
                     continue
                 item = dict(raw)
                 item.pop("id", None)
+                if collection_name == "bookings":
+                    item["events"] = events_by_booking.get(document_id, [])
                 migration_batch.set(ref, item)
                 writes += 1
-                if collection_name == "bookings" and raw.get("idempotency_key"):
-                    idem_id = hashlib.sha256(raw["idempotency_key"].encode()).hexdigest()
-                    migration_batch.set(FIRESTORE.collection("idempotency").document(idem_id), {"booking_id": document_id})
-                    writes += 1
             if writes:
                 migration_batch.commit()
     migration_marker.set({"version": 1, "uploaded_at": stamp(now()), "source": "sqlite"})
 
 
 def seed_firestore_users_and_devices() -> None:
-    users = FIRESTORE.collection("users")
-    for user_id, username, role, name in (
-        ("demo-user", "user", "user", "Người dùng demo"),
-        ("demo-admin", "admin", "admin", "Quản trị viên"),
-    ):
-        ref = users.document(user_id)
-        if not ref.get().exists:
-            ref.set({"user_id": user_id, "username": username, "role": role, "name": name, "demo": True})
+    # Demo credentials and role metadata are local. Device configuration is
+    # stored directly on each room instead of a separate collection.
     device_labels = {"lamp": "Đèn", "fan": "Quạt", "speaker": "Loa"}
-    batch = FIRESTORE.batch()
-    count = 0
-    for room in fs_rooms():
+    for room_doc in FIRESTORE.collection("rooms").stream():
+        room = room_doc.to_dict() or {}
+        config = room.get("device_config", {})
+        changed = False
         for device, label in device_labels.items():
-            ref = FIRESTORE.collection("devices").document("%s_%s" % (room["id"], device))
-            snapshot = ref.get()
-            payload = {
-                "id": "%s_%s" % (room["id"], device), "room_id": room["id"],
-                "device": device,
-                "on": bool(room.get(DEVICE_COLUMNS[device], False)),
-                "topic_command": "rooms/%s/devices/%s/command" % (room["id"], device),
-                "topic_status": "rooms/%s/devices/%s/status" % (room["id"], device),
-            }
-            if not snapshot.exists:
-                payload.update({"name": label, "enabled": True})
-            batch.set(ref, payload, merge=True)
-            count += 1
-            if count == 450:
-                batch.commit()
-                batch = FIRESTORE.batch()
-                count = 0
-    if count:
-        batch.commit()
+            if device in config:
+                continue
+            old_ref = FIRESTORE.collection("devices").document("%s_%s" % (room_doc.id, device))
+            old_snapshot = old_ref.get()
+            old = old_snapshot.to_dict() or {} if old_snapshot.exists else {}
+            config[device] = {"name": old.get("name", label), "enabled": bool(old.get("enabled", True))}
+            changed = True
+        if changed:
+            room_doc.reference.set({"device_config": config}, merge=True)
 
 
 def fs_room(room_id: int) -> Optional[dict[str, Any]]:
@@ -335,18 +335,9 @@ def fs_room(room_id: int) -> Optional[dict[str, Any]]:
         return None
     room = snapshot.to_dict()
     room.setdefault("id", room_id)
-    status_snapshot = FIRESTORE.collection("room_status").document(str(room_id)).get()
-    if status_snapshot.exists:
-        status = status_snapshot.to_dict() or {}
-        room["online"] = bool(status.get("online", room.get("online", True)))
-        room["occupied"] = bool(status.get("occupied", room.get("occupied", False)))
-        device_states = status.get("devices", {})
-        for device, column in DEVICE_COLUMNS.items():
-            if device in device_states:
-                room[column] = bool(device_states[device])
-        if status.get("last_seen"):
-            room["last_seen"] = status["last_seen"]
-    room["amenity_ids"], room["amenities"] = fs_room_amenities(room_id)
+    room["amenity_ids"] = [str(value) for value in room.get("amenity_ids", [])]
+    catalog = {str(item["id"]): item for item in get_amenities(include_disabled=True)}
+    room["amenities"] = [catalog[key]["name"] for key in room["amenity_ids"] if key in catalog and catalog[key].get("enabled", True)]
     for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
         room.setdefault(key, False if key != "online" else True)
     return room
@@ -374,23 +365,18 @@ def fs_rooms() -> list[dict[str, Any]]:
             return copy.deepcopy(FS_ROOM_CACHE)
         try:
             room_docs = list(FIRESTORE.collection("rooms").stream())
-            status_docs = list(FIRESTORE.collection("room_status").stream())
-            status_by_room = {str(doc.id): (doc.to_dict() or {}) for doc in status_docs}
             rooms = []
             for doc in room_docs:
                 room = doc.to_dict() or {}
                 room_id = int(doc.id)
                 room.setdefault("id", room_id)
-                status = status_by_room.get(str(room_id), {})
-                room["online"] = bool(status.get("online", room.get("online", True)))
-                room["occupied"] = bool(status.get("occupied", room.get("occupied", False)))
-                devices = status.get("devices", {})
-                for device, column in DEVICE_COLUMNS.items():
-                    room[column] = bool(devices.get(device, room.get(column, False)))
-                if status.get("last_seen"):
-                    room["last_seen"] = status["last_seen"]
+                room["online"] = bool(room.get("online", True))
+                room["occupied"] = bool(room.get("occupied", False))
+                for column in DEVICE_COLUMNS.values():
+                    room[column] = bool(room.get(column, False))
                 room["amenity_ids"] = [str(value) for value in room.get("amenity_ids", [])]
-                room["amenities"] = list(room.get("amenities", []))
+                catalog = {str(item["id"]): item for item in get_amenities(include_disabled=True)}
+                room["amenities"] = [catalog[key]["name"] for key in room["amenity_ids"] if key in catalog and catalog[key].get("enabled", True)]
                 rooms.append(room)
             rooms.sort(key=lambda room: room["id"])
             FS_ROOM_CACHE = rooms
@@ -426,16 +412,7 @@ def room_status_document(room_id: int, room: dict[str, Any]) -> dict[str, Any]:
 
 
 def sync_firestore_room_summaries() -> None:
-    """Keep embedded amenity lists and per-room status documents available."""
-    for room in fs_rooms():
-        room_id = int(room["id"])
-        FIRESTORE.collection("rooms").document(str(room_id)).set({
-            "amenity_ids": room.get("amenity_ids", []),
-            "amenities": room.get("amenities", []),
-        }, merge=True)
-        status_ref = FIRESTORE.collection("room_status").document(str(room_id))
-        if not status_ref.get().exists:
-            status_ref.set(room_status_document(room_id, room))
+    """Retained as a bootstrap hook; room documents are the canonical source."""
 
 
 def amenity_key(name: str) -> str:
@@ -445,59 +422,71 @@ def amenity_key(name: str) -> str:
 
 
 def migrate_firestore_amenities() -> None:
-    """Replace legacy room details with the three supported device amenities once."""
-    marker = FIRESTORE.collection("app_meta").document("amenity_catalog_v2")
+    """Seed the fixed catalog without resetting room-specific settings or old data."""
+    marker = FIRESTORE.collection("app_meta").document("amenity_catalog_v4")
     if marker.get().exists:
         return
     existing = {doc.id: (doc.to_dict() or {}) for doc in FIRESTORE.collection("amenities").stream()}
-    for doc in FIRESTORE.collection("room_amenities").stream():
-        doc.reference.delete()
-    for doc in FIRESTORE.collection("amenities").stream():
-        doc.reference.delete()
+    catalog_items = {}
     for key, (name, description) in ROOM_AMENITIES.items():
         previous = existing.get(key, {})
-        FIRESTORE.collection("amenities").document(key).set({
-            "id": key, "name": name, "description": description,
-            "enabled": bool(previous.get("enabled", True)),
-        })
-    for room_doc in FIRESTORE.collection("rooms").stream():
-        for key in ROOM_AMENITIES:
-            FIRESTORE.collection("room_amenities").document("%s_%s" % (room_doc.id, key)).set({"room_id": int(room_doc.id), "amenity_id": key})
-    marker.set({"version": 2, "migrated_at": stamp(now())})
+        catalog_items[key] = {"name": name, "description": description, "enabled": bool(previous.get("enabled", True))}
+    FIRESTORE.collection("app_meta").document("amenities").set({"items": catalog_items})
+    marker.set({"version": 4, "migrated_at": stamp(now()), "schema": "compact_core_collections"})
 
 
 def assign_all_amenities_to_rooms_once() -> None:
-    """Give each existing room all three selectable amenities on this upgrade only."""
-    marker = FIRESTORE.collection("app_meta").document("all_rooms_have_all_amenities_v1")
+    """Embed legacy amenity links once, preserving room-specific selections."""
+    marker = FIRESTORE.collection("app_meta").document("all_rooms_have_all_amenities_v3")
     if marker.get().exists:
         return
-    catalog = [key for key in ROOM_AMENITIES if FIRESTORE.collection("amenities").document(key).get().exists]
     batch = FIRESTORE.batch()
     writes = 0
     for room in FIRESTORE.collection("rooms").stream():
-        try:
-            room_id = int(room.id)
-        except (TypeError, ValueError):
-            continue
-        for amenity_id in catalog:
-            ref = FIRESTORE.collection("room_amenities").document("%s_%s" % (room.id, amenity_id))
-            batch.set(ref, {"room_id": room_id, "amenity_id": amenity_id})
-            writes += 1
-            if writes == 450:
-                batch.commit()
-                batch = FIRESTORE.batch()
-                writes = 0
-    batch.set(marker, {"version": 1, "migrated_at": stamp(now())})
+        payload = room.to_dict() or {}
+        ids = [str(value) for value in payload.get("amenity_ids", [])]
+        if not ids:
+            legacy_links = FIRESTORE.collection("room_amenities").where("room_id", "==", int(room.id)).stream()
+            ids = [str((link.to_dict() or {}).get("amenity_id")) for link in legacy_links]
+        if not ids:
+            # Legacy app policy made all three devices selectable in every room.
+            ids = list(ROOM_AMENITIES)
+        legacy_status = FIRESTORE.collection("room_status").document(room.id).get()
+        status = legacy_status.to_dict() or {} if legacy_status.exists else {}
+        room_updates = {
+            "amenity_ids": sorted(set(ids)),
+            "amenities": firestore.DELETE_FIELD,
+            "online": bool(status.get("online", payload.get("online", True))),
+            "occupied": bool(status.get("occupied", payload.get("occupied", False))),
+            "last_seen": status.get("last_seen", payload.get("last_seen")),
+        }
+        for device, column in DEVICE_COLUMNS.items():
+            room_updates[column] = bool(status.get("devices", {}).get(device, payload.get(column, False)))
+        old_configs = {}
+        for device, label in (("lamp", "Đèn"), ("fan", "Quạt"), ("speaker", "Loa")):
+            old_ref = FIRESTORE.collection("devices").document("%s_%s" % (room.id, device))
+            old_snapshot = old_ref.get()
+            old = old_snapshot.to_dict() or {} if old_snapshot.exists else {}
+            old_configs[device] = {"name": old.get("name", label), "enabled": bool(old.get("enabled", True))}
+        room_updates["device_config"] = payload.get("device_config") or old_configs
+        batch.set(room.reference, room_updates, merge=True)
+        writes += 1
+        if writes == 450:
+            batch.commit()
+            batch = FIRESTORE.batch()
+            writes = 0
+    batch.set(marker, {"version": 2, "migrated_at": stamp(now())})
     batch.commit()
 
 
 def fs_room_amenities(room_id: int) -> tuple[list[str], list[str]]:
-    linked = [doc.to_dict() or {} for doc in FIRESTORE.collection("room_amenities").where("room_id", "==", room_id).stream()]
-    catalog = {doc.id: (doc.to_dict() or {}) for doc in FIRESTORE.collection("amenities").stream()}
-    items = [(str(row.get("amenity_id", "")), catalog.get(str(row.get("amenity_id", "")), {}).get("name")) for row in linked]
-    items = [(aid, name) for aid, name in items if name]
-    enabled_names = [catalog[aid]["name"] for aid, _ in items if catalog[aid].get("enabled", True)]
-    return [aid for aid, _ in items], enabled_names
+    snapshot = FIRESTORE.collection("rooms").document(str(room_id)).get()
+    if not snapshot.exists:
+        return [], []
+    ids = [str(value) for value in (snapshot.to_dict() or {}).get("amenity_ids", [])]
+    catalog = {str(item["id"]): item for item in get_amenities(include_disabled=True)}
+    names = [catalog[key]["name"] for key in ids if key in catalog and catalog[key].get("enabled", True)]
+    return ids, names
 
 
 def resolve_booking_amenities(room_id: int, requested_ids: list[str]) -> list[str]:
@@ -533,7 +522,11 @@ def get_amenities(include_disabled: bool = False) -> list[dict[str, Any]]:
                 items = copy.deepcopy(AMENITY_CACHE)
             else:
                 try:
-                    items = [dict(doc.to_dict() or {}, id=doc.id) for doc in FIRESTORE.collection("amenities").stream()]
+                    catalog_doc = FIRESTORE.collection("app_meta").document("amenities").get()
+                    if catalog_doc.exists:
+                        items = [dict(value, id=key) for key, value in (catalog_doc.to_dict() or {}).get("items", {}).items()]
+                    else:
+                        items = [dict(doc.to_dict() or {}, id=doc.id) for doc in FIRESTORE.collection("amenities").stream()]
                     AMENITY_CACHE = items
                     AMENITY_CACHE_AT = current
                     AMENITY_CACHE_RETRY_AT = 0.0
@@ -580,11 +573,25 @@ def resolve_amenity_filter(values: list[str]) -> list[str]:
 
 
 def fs_add_audit(actor: str, action: str, detail: str) -> None:
-    FIRESTORE.collection("audit").add({"actor": actor, "action": action, "detail": detail, "at": stamp(now())})
+    event_at = now()
+    event_data = {"actor": actor, "action": action, "detail": detail, "at": audit_timestamp(event_at)}
+    FIRESTORE.collection("audit").document(audit_document_id(event_at)).set(event_data)
+
+
+def audit_document_id(event_at: datetime) -> str:
+    """Prefix audit IDs with UTC time so Firestore Console's ID order is chronological."""
+    return event_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ_") + uuid.uuid4().hex[:8]
+
+
+def audit_timestamp(event_at: datetime) -> str:
+    """Keep audit times precise enough to order events created in the same minute."""
+    return event_at.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def fs_add_event(booking_id: str, event: str, detail: str) -> None:
-    FIRESTORE.collection("booking_events").add({"booking_id": booking_id, "event": event, "detail": detail, "at": stamp(now())})
+    FIRESTORE.collection("bookings").document(booking_id).update({
+        "events": firestore.ArrayUnion([{"event": event, "detail": detail, "at": stamp(now())}])
+    })
 
 
 def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
@@ -592,16 +599,7 @@ def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
     snapshot = ref.get()
     if not snapshot.exists:
         return False
-    room = snapshot.to_dict() or {}
-    room.update(updates)
-    batch = FIRESTORE.batch()
-    batch.set(ref, updates, merge=True)
-    batch.set(FIRESTORE.collection("room_status").document(str(room_id)), room_status_document(room_id, room), merge=True)
-    device_updates = {device: updates[column] for device, column in DEVICE_COLUMNS.items() if column in updates}
-    if device_updates:
-        for device, value in device_updates.items():
-            batch.set(FIRESTORE.collection("devices").document("%s_%s" % (room_id, device)), {"on": bool(value)}, merge=True)
-    batch.commit()
+    ref.set(updates, merge=True)
     invalidate_fs_room_cache()
     return True
 
@@ -620,16 +618,15 @@ def transition_firestore_booking(booking_id: str, expected: str, target: str) ->
         room_snapshot = None
         if target == "COMPLETED":
             room_snapshot = fs_transaction_get_one(transaction, room_ref)
-        transaction.update(booking_ref, {"status": target})
+        transaction.update(booking_ref, {
+            "status": target,
+            "events": firestore.ArrayUnion([{"event": target, "at": stamp(now()), "detail": "Tự động chuyển trạng thái theo thời gian booking"}]),
+        })
         if target == "COMPLETED" and room_snapshot is not None and room_snapshot.exists:
             transaction.update(room_ref, {"occupied": False})
-            room_state = room_snapshot.to_dict() or {}
-            room_state["occupied"] = False
-            transaction.set(FIRESTORE.collection("room_status").document(str(booking["room_id"])), room_status_document(int(booking["room_id"]), room_state), merge=True)
-        event_ref = FIRESTORE.collection("booking_events").document()
-        transaction.set(event_ref, {"booking_id": booking_id, "event": target, "at": stamp(now()), "detail": "Tự động chuyển trạng thái theo thời gian booking"})
-        audit_ref = FIRESTORE.collection("audit").document()
-        transaction.set(audit_ref, {"actor": "booking-lifecycle", "action": target, "detail": booking_id, "at": stamp(now())})
+        event_at = now()
+        audit_ref = FIRESTORE.collection("audit").document(audit_document_id(event_at))
+        transaction.set(audit_ref, {"actor": "booking-lifecycle", "action": target, "detail": booking_id, "at": audit_timestamp(event_at)})
         return True
 
     row_result["changed"] = transition(FIRESTORE.transaction())
@@ -759,32 +756,29 @@ def fs_booking_conflict(room_id: int, start: str, end: str, exclude_id: Optional
 
 
 def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: datetime, end: datetime, amenities: list[str]) -> dict[str, Any]:
-    booking_id = str(uuid.uuid4())
+    booking_id = hashlib.sha256(data.idempotency_key.encode()).hexdigest()[:32] if data.idempotency_key else str(uuid.uuid4())
     booking_ref = FIRESTORE.collection("bookings").document(booking_id)
     room_ref = FIRESTORE.collection("rooms").document(str(data.room_id))
-    idem_ref = None
-    if data.idempotency_key:
-        idem_id = hashlib.sha256(data.idempotency_key.encode()).hexdigest()
-        idem_ref = FIRESTORE.collection("idempotency").document(idem_id)
     expiration = end + timedelta(minutes=15)
     booking = None
 
     @firestore.transactional
     def commit(transaction):
         nonlocal booking
-        if idem_ref is not None:
-            existing_idempotency = fs_transaction_get_one(transaction, idem_ref)
-            if existing_idempotency is not None and existing_idempotency.exists:
-                existing_data = existing_idempotency.to_dict() or {}
-                existing_booking_id = existing_data.get("booking_id")
-                if existing_booking_id:
-                    existing_booking = fs_transaction_get_one(
-                        transaction,
-                        FIRESTORE.collection("bookings").document(existing_booking_id),
-                    )
-                    if existing_booking is not None and existing_booking.exists:
-                        booking = {**existing_booking.to_dict(), "id": existing_booking.id}
-                        return booking
+        existing_booking = fs_transaction_get_one(transaction, booking_ref)
+        if existing_booking is not None and existing_booking.exists:
+            existing_data = existing_booking.to_dict() or {}
+            if existing_data.get("idempotency_key") == data.idempotency_key:
+                booking = {**existing_data, "id": existing_booking.id}
+                return booking
+        if data.idempotency_key:
+            legacy_matches = transaction.get(
+                FIRESTORE.collection("bookings").where("idempotency_key", "==", data.idempotency_key).limit(1)
+            )
+            legacy_match = next(iter(legacy_matches), None)
+            if legacy_match is not None and legacy_match.exists:
+                booking = {**(legacy_match.to_dict() or {}), "id": legacy_match.id}
+                return booking
         room_snapshot = fs_transaction_get_one(transaction, room_ref)
         if room_snapshot is None or not room_snapshot.exists:
             raise HTTPException(404, "Không tìm thấy phòng")
@@ -802,17 +796,16 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
             "start": stamp(start), "end": stamp(end), "people": data.people,
             "cost": cost, "status": "CONFIRMED", "qr_exp": stamp(expiration), "amenities": amenities,
             "idempotency_key": data.idempotency_key, "created": stamp(now()),
+            "events": [
+                {"event": "PENDING", "at": stamp(now()), "detail": "Yêu cầu đã qua bước xác nhận của người dùng"},
+                {"event": "CONFIRMED", "at": stamp(now()), "detail": "Booking đã xác nhận"},
+            ],
         }
         transaction.create(booking_ref, booking)
         transaction.update(room_ref, {"booking_version": int(room.get("booking_version", 0)) + 1})
-        event_ref = FIRESTORE.collection("booking_events").document()
-        transaction.set(event_ref, {"booking_id": booking_id, "event": "PENDING", "at": stamp(now()), "detail": "Yêu cầu đã qua bước xác nhận của người dùng"})
-        confirmed_event_ref = FIRESTORE.collection("booking_events").document()
-        transaction.set(confirmed_event_ref, {"booking_id": booking_id, "event": "CONFIRMED", "at": stamp(now()), "detail": "Booking đã xác nhận"})
-        audit_ref = FIRESTORE.collection("audit").document()
-        transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CREATED", "detail": booking_id, "at": stamp(now())})
-        if idem_ref is not None:
-            transaction.set(idem_ref, {"booking_id": booking_id})
+        event_at = now()
+        audit_ref = FIRESTORE.collection("audit").document(audit_document_id(event_at))
+        transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CREATED", "detail": booking_id, "at": audit_timestamp(event_at)})
         return booking
 
     try:
@@ -1006,6 +999,12 @@ class LoginIn(BaseModel):
     password: str
 
 
+class RegisterIn(BaseModel):
+    username: str = Field(min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=2, max_length=60)
+    password: str = Field(min_length=8, max_length=128)
+
+
 DEMO_ACCOUNTS = {
     "user": {"password": "demo123", "user_id": "demo-user", "role": "user", "name": "Người dùng demo"},
     "admin": {"password": "admin123", "user_id": "demo-admin", "role": "admin", "name": "Quản trị viên"},
@@ -1018,6 +1017,78 @@ def current_user(authorization: Optional[str] = Header(default=None)) -> dict[st
     if not identity:
         raise HTTPException(401, "Vui lòng đăng nhập")
     return identity
+
+
+def password_digest(password: str, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 260_000).hex()
+
+
+def create_user_account(username: str, name: str, password: str) -> dict[str, str]:
+    key = username.strip().casefold()
+    clean_name = " ".join(name.split())
+    if not clean_name:
+        raise HTTPException(400, "Vui lòng nhập tên hiển thị")
+    salt = secrets.token_bytes(16)
+    account = {
+        "username": key,
+        "user_id": "user-" + uuid.uuid4().hex,
+        "role": "user",
+        "name": clean_name,
+        "password_salt": salt.hex(),
+        "password_hash": password_digest(password, salt),
+        "created_at": stamp(now()),
+    }
+    if FIRESTORE is not None:
+        ref = FIRESTORE.collection("app_meta").document("auth").collection("users").document(key)
+        try:
+            ref.create(account)
+        except Exception as exc:
+            if type(exc).__name__ == "AlreadyExists":
+                raise HTTPException(409, "Tên tài khoản này đã được sử dụng") from exc
+            raise
+    else:
+        try:
+            with db() as connection:
+                connection.execute(
+                    "INSERT INTO users(username,user_id,name,password_salt,password_hash,created_at) VALUES(?,?,?,?,?,?)",
+                    (key, account["user_id"], clean_name, account["password_salt"], account["password_hash"], account["created_at"]),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "Tên tài khoản này đã được sử dụng") from exc
+    return account
+
+
+def find_user_account(username: str) -> Optional[dict[str, str]]:
+    key = username.strip().casefold()
+    if FIRESTORE is not None:
+        snapshot = FIRESTORE.collection("app_meta").document("auth").collection("users").document(key).get()
+        return snapshot.to_dict() if snapshot.exists else None
+    with db() as connection:
+        row = connection.execute("SELECT * FROM users WHERE username=?", (key,)).fetchone()
+        return dict(row) if row else None
+
+
+def authenticate_account(username: str, password: str) -> dict[str, str]:
+    key = username.strip().casefold()
+    demo = DEMO_ACCOUNTS.get(key)
+    if demo and hmac.compare_digest(password, demo["password"]):
+        return {"user_id": demo["user_id"], "role": demo["role"], "name": demo["name"]}
+    account = find_user_account(key)
+    if not account:
+        raise HTTPException(401, "Tên đăng nhập hoặc mật khẩu không đúng")
+    try:
+        actual = password_digest(password, bytes.fromhex(account["password_salt"]))
+    except (KeyError, ValueError):
+        raise HTTPException(401, "Tên đăng nhập hoặc mật khẩu không đúng")
+    if not hmac.compare_digest(actual, account.get("password_hash", "")):
+        raise HTTPException(401, "Tên đăng nhập hoặc mật khẩu không đúng")
+    return {"user_id": account["user_id"], "role": "user", "name": account["name"]}
+
+
+def issue_session(account: dict[str, str]) -> dict[str, Any]:
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {key: str(account[key]) for key in ("user_id", "role", "name")}
+    return {"token": token, "user": SESSIONS[token]}
 
 
 def parse_dt(raw: str) -> datetime:
@@ -1155,12 +1226,17 @@ def health():
 
 @app.post("/api/auth/login")
 def login(data: LoginIn):
-    account = DEMO_ACCOUNTS.get(data.username)
-    if not account or not hmac.compare_digest(data.password, account["password"]):
-        raise HTTPException(401, "Tên đăng nhập hoặc mật khẩu không đúng")
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {"user_id": account["user_id"], "role": account["role"], "name": account["name"]}
-    return {"token": token, "user": SESSIONS[token]}
+    return issue_session(authenticate_account(data.username, data.password))
+
+
+@app.post("/api/auth/register")
+def register(data: RegisterIn):
+    key = data.username.strip().casefold()
+    if key in DEMO_ACCOUNTS:
+        raise HTTPException(409, "Tên tài khoản này đã được dành cho tài khoản demo")
+    account = create_user_account(key, data.name, data.password)
+    identity = {"user_id": account["user_id"], "role": "user", "name": account["name"]}
+    return issue_session(identity)
 
 
 @app.get("/api/auth/me")
@@ -1210,10 +1286,13 @@ def update_amenity(amenity_id: str, values: dict[str, Any], identity: dict[str, 
         values["enabled"] = bool(values["enabled"])
     try:
         if FIRESTORE is not None:
-            ref = FIRESTORE.collection("amenities").document(amenity_id)
-            if not ref.get().exists:
+            ref = FIRESTORE.collection("app_meta").document("amenities")
+            snapshot = ref.get()
+            items = (snapshot.to_dict() or {}).get("items", {}) if snapshot.exists else {}
+            if amenity_id not in items:
                 raise HTTPException(404, "Không tìm thấy tiện ích")
-            ref.update(values)
+            items[amenity_id].update(values)
+            ref.set({"items": items})
             fs_add_audit("admin", "AMENITY_UPDATED", amenity_id + ": " + json.dumps(values, ensure_ascii=False))
         else:
             with db() as c:
@@ -1235,19 +1314,11 @@ def assign_room_amenities(room_id: int, values: dict[str, Any], identity: dict[s
     if any(aid not in catalog for aid in ids):
         raise HTTPException(400, "Có tiện ích không tồn tại")
     if FIRESTORE is not None:
-        if not FIRESTORE.collection("rooms").document(str(room_id)).get().exists:
+        room_ref = FIRESTORE.collection("rooms").document(str(room_id))
+        room_snapshot = room_ref.get()
+        if not room_snapshot.exists:
             raise HTTPException(404, "Không tìm thấy phòng")
-        collection = FIRESTORE.collection("room_amenities")
-        batch = FIRESTORE.batch()
-        for doc in collection.where("room_id", "==", room_id).stream():
-            batch.delete(doc.reference)
-        for aid in ids:
-            batch.set(collection.document("%s_%s" % (room_id, aid)), {"room_id": room_id, "amenity_id": aid})
-        batch.set(FIRESTORE.collection("rooms").document(str(room_id)), {
-            "amenity_ids": ids,
-            "amenities": [catalog[aid]["name"] for aid in ids if catalog[aid].get("enabled", True)],
-        }, merge=True)
-        batch.commit()
+        room_ref.set({"amenity_ids": ids, "amenities": firestore.DELETE_FIELD}, merge=True)
         invalidate_fs_room_cache()
         fs_add_audit("admin", "ROOM_AMENITIES_UPDATED", "room=%s; amenities=%s" % (room_id, ",".join(ids)))
     else:
@@ -1340,7 +1411,7 @@ def get_booking(booking_id: str, identity: dict[str, str] = Depends(current_user
 def booking_events(booking_id: str, identity: dict[str, str] = Depends(current_user)):
     booking = get_booking(booking_id, identity)
     if FIRESTORE is not None:
-        events = [doc.to_dict() for doc in FIRESTORE.collection("booking_events").where("booking_id", "==", booking_id).stream()]
+        events = booking.get("events", [])
     else:
         with db() as c:
             events = [dict(row) for row in c.execute("SELECT * FROM events WHERE booking_id=? ORDER BY id", (booking_id,)).fetchall()]
@@ -1361,11 +1432,13 @@ def cancel_booking(booking_id: str, identity: dict[str, str] = Depends(current_u
                 raise HTTPException(403, "Không có quyền hủy booking này")
             if row.get("status") != "CONFIRMED":
                 raise HTTPException(409, "Chỉ hủy được booking CONFIRMED")
-            transaction.update(ref, {"status": "CANCELLED"})
-            event_ref = FIRESTORE.collection("booking_events").document()
-            audit_ref = FIRESTORE.collection("audit").document()
-            transaction.set(event_ref, {"booking_id": booking_id, "event": "CANCELLED", "detail": "Người dùng hủy booking", "at": stamp(now())})
-            transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CANCELLED", "detail": booking_id, "at": stamp(now())})
+            transaction.update(ref, {
+                "status": "CANCELLED",
+                "events": firestore.ArrayUnion([{"booking_id": booking_id, "event": "CANCELLED", "detail": "Người dùng hủy booking", "at": stamp(now())}]),
+            })
+            event_at = now()
+            audit_ref = FIRESTORE.collection("audit").document(audit_document_id(event_at))
+            transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CANCELLED", "detail": booking_id, "at": audit_timestamp(event_at)})
             return True
         cancel(FIRESTORE.transaction())
         return {"ok": True, "status": "CANCELLED"}
@@ -1416,15 +1489,14 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
             room_snapshot = fs_transaction_get_one(transaction, room_ref)
             if room_snapshot is None or not room_snapshot.exists:
                 raise HTTPException(404, "Không tìm thấy phòng")
-            transaction.update(booking_ref, {"status": "CHECKED_IN"})
+            transaction.update(booking_ref, {
+                "status": "CHECKED_IN",
+                "events": firestore.ArrayUnion([{"booking_id": row["id"], "event": "CHECKED_IN", "at": stamp(now()), "detail": "QR hợp lệ; gửi lệnh bật đèn, quạt, loa"}]),
+            })
             transaction.update(room_ref, {"occupied": True})
-            room_state = room_snapshot.to_dict() or {}
-            room_state["occupied"] = True
-            transaction.set(FIRESTORE.collection("room_status").document(str(data.room_id)), room_status_document(data.room_id, room_state), merge=True)
-            event_ref = FIRESTORE.collection("booking_events").document()
-            transaction.set(event_ref, {"booking_id": row["id"], "event": "CHECKED_IN", "at": stamp(now()), "detail": "QR hợp lệ; gửi lệnh bật đèn, quạt, loa"})
-            audit_ref = FIRESTORE.collection("audit").document()
-            transaction.set(audit_ref, {"actor": row["user_id"], "action": "CHECK_IN", "detail": row["id"], "at": stamp(now())})
+            event_at = now()
+            audit_ref = FIRESTORE.collection("audit").document(audit_document_id(event_at))
+            transaction.set(audit_ref, {"actor": row["user_id"], "action": "CHECK_IN", "detail": row["id"], "at": audit_timestamp(event_at)})
             return row
 
         row = checkin(FIRESTORE.transaction())
@@ -1522,8 +1594,7 @@ def command_devices(room_id: int, data: DeviceCommandIn, identity: dict[str, str
         if not room:
             raise HTTPException(404, "Không tìm thấy phòng")
         for device in data.devices:
-            config = FIRESTORE.collection("devices").document("%s_%s" % (room_id, device)).get()
-            if config.exists and not config.to_dict().get("enabled", True):
+            if not room.get("device_config", {}).get(device, {}).get("enabled", True):
                 raise HTTPException(409, "Thiết bị %s đang bị Admin vô hiệu hóa" % device)
     else:
         with db() as c:
@@ -2375,7 +2446,20 @@ def get_audit(identity: dict[str, str] = Depends(current_user)):
 def admin_devices(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
     if FIRESTORE is not None:
-        return sorted([doc.to_dict() for doc in FIRESTORE.collection("devices").stream()], key=lambda row: (row.get("room_id", 0), row.get("device", "")))
+        result = []
+        for room in fs_rooms():
+            configs = room.get("device_config", {})
+            for device in DEVICE_COLUMNS:
+                config = configs.get(device, {})
+                result.append({
+                    "id": f"{room['id']}_{device}", "room_id": room["id"], "device": device,
+                    "name": config.get("name", ROOM_AMENITIES[device][0]),
+                    "enabled": bool(config.get("enabled", True)),
+                    "on": bool(room.get(DEVICE_COLUMNS[device], False)),
+                    "topic_command": f"rooms/{room['id']}/devices/{device}/command",
+                    "topic_status": f"rooms/{room['id']}/devices/{device}/status",
+                })
+        return result
     with db() as c:
         result = []
         for row in c.execute("SELECT d.*,r." + ",r.".join(DEVICE_COLUMNS.values()) + " FROM devices d JOIN rooms r ON r.id=d.room_id ORDER BY d.room_id,d.device").fetchall():
@@ -2395,10 +2479,16 @@ def configure_device(room_id: int, device: str, values: DeviceConfigIn, identity
     if not updates or ("name" in updates and (not updates["name"].strip() or len(updates["name"]) > 40)):
         raise HTTPException(400, "Cần tên thiết bị hợp lệ hoặc trạng thái enabled")
     if FIRESTORE is not None:
-        ref = FIRESTORE.collection("devices").document("%s_%s" % (room_id, device))
-        if not ref.get().exists:
+        ref = FIRESTORE.collection("rooms").document(str(room_id))
+        snapshot = ref.get()
+        if not snapshot.exists:
             raise HTTPException(404, "Không tìm thấy thiết bị")
-        ref.update(updates)
+        room = snapshot.to_dict() or {}
+        configs = room.get("device_config", {})
+        if device not in configs:
+            configs[device] = {"name": ROOM_AMENITIES[device][0], "enabled": True}
+        configs[device].update(updates)
+        ref.set({"device_config": configs}, merge=True)
         fs_add_audit(identity["user_id"], "DEVICE_CONFIG_UPDATED", "room=%s; device=%s; %s" % (room_id, device, json.dumps(updates, ensure_ascii=False)))
     else:
         with db() as c:

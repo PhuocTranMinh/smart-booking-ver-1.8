@@ -34,7 +34,7 @@ Không cần kích hoạt `.venv` bằng `Activate.ps1`. Mở http://127.0.0.1:8
 
 ## API chính
 
-- `POST /api/auth/login`, `GET /api/auth/me`
+- `POST /api/auth/login`, `POST /api/auth/register`, `GET /api/auth/me`
 - `GET /api/health` báo đang dùng `firestore` hay SQLite local.
 - `GET /api/rooms`, `GET /api/amenities`, `GET /api/availability?start=...&end=...&people=...&amenities=id1,id2`
 - `POST /api/bookings`, `GET /api/bookings`, `POST /api/bookings/{id}/cancel`
@@ -48,7 +48,7 @@ Ngày giờ API dùng ISO 8601. Khi chưa đặt credential Firebase, app dùng 
 
 ### Cấu hình Firebase/Firestore
 
-Firestore lưu dữ liệu theo thực thể trong đề tài: người dùng, phòng (kèm tiện ích), trạng thái phòng, thiết bị, booking, lịch sử booking và audit. Các collection phụ `amenities`, `room_amenities`, `idempotency` và `app_meta` hỗ trợ quản lý tiện ích, chống tạo booking lặp và migration. Việc upload SQLite có lệnh xem trước và lệnh áp dụng riêng; chi tiết nằm trong [Hướng dẫn upload Firebase](docs/FIREBASE_UPLOAD.md). `/api/health` báo kết nối Firestore sau khi app khởi động.
+Firestore được gom về 4 collection: `rooms`, `bookings`, `audit`, `app_meta`. Cấu hình tiện ích, trạng thái và thiết bị nằm trong phòng; lịch sử nằm trong booking; demo user được giữ trong app. Dữ liệu Firestore cũ được chuyển bằng script có xem trước và backup; xem [Hướng dẫn Firebase](docs/FIREBASE_UPLOAD.md). `/api/health` báo kết nối Firestore sau khi app khởi động.
 
 ## MQTT cho thiết bị
 
@@ -98,14 +98,14 @@ Nếu chưa cấu hình credential Firestore, Render chạy SQLite trên filesys
 
 ## Đối chiếu yêu cầu Capstone
 
-Đã có trong demo phần mềm: đăng nhập phân vai demo; tra phòng theo ngày/giờ/thời lượng/sức chứa/Đèn/Quạt/Loa; hội thoại nhiều lượt; booking, trạng thái, hủy, lịch sử sự kiện; chống trùng lịch và idempotency; QR HMAC với kiểm tra chủ booking/phòng/thời hạn/cửa sổ check-in; MQTT topic cho telemetry/status/command; giao diện quản trị occupancy, online/offline, thiết bị, cấu hình phòng/giá, cấu hình khóa thiết bị và audit; tự đánh dấu `NO_SHOW`, hoàn tất booking và tắt trạng thái thiết bị mô phỏng. SQLite và Firestore lưu riêng `rooms`, `amenities` và liên kết `room_amenities`, cùng bookings, users, devices, booking events và audit. App tự chuyển danh sách tiện nghi cũ trong phòng sang cấu trúc tách riêng khi khởi động.
+Đã có trong demo phần mềm: đăng nhập phân vai demo; tra phòng theo ngày/giờ/thời lượng/sức chứa/Đèn/Quạt/Loa; hội thoại nhiều lượt; booking, trạng thái, hủy, lịch sử sự kiện; chống trùng lịch và idempotency; QR HMAC với kiểm tra chủ booking/phòng/thời hạn/cửa sổ check-in; MQTT topic cho telemetry/status/command; giao diện quản trị occupancy, online/offline, thiết bị, cấu hình phòng/giá, cấu hình khóa thiết bị và audit; tự đánh dấu `NO_SHOW`, hoàn tất booking và tắt trạng thái thiết bị mô phỏng. Firestore dùng bốn collection cốt lõi; migration backup dữ liệu cũ trước khi loại các collection phụ.
 
 Các hạng mục chưa thể hoàn tất chỉ bằng demo web:
 
 1. **Phần cứng:** chưa có firmware ESP32/controller, cảm biến PIR, đầu đọc QR vật lý, watchdog, FSM chạy trực tiếp trên thiết bị, xử lý an toàn khi mất mạng/khởi động lại và xác nhận lệnh phần cứng. Backend nhận/gửi MQTT khi cấu hình broker; chức năng thiết bị hiện chưa chứng minh trên phần cứng thật.
 2. **Chatbot AI:** dùng Groq `openai/gpt-oss-20b` để trả lời câu hỏi chưa có mẫu; các câu hỏi booking và dữ liệu phòng vẫn do code cục bộ xử lý. Cần đặt `GROQ_API_KEY` trong Render Secret.
 3. **Kiểm thử nghiệm thu:** chưa chạy bộ 100 câu tiếng Việt, thử đặt đồng thời tải cao, đo thời gian QR dưới 2 giây, thử ngắt mạng/khôi phục với controller thật, hoặc xác minh quyền trên deployment Render/Firestore. Các mục này cần môi trường nghiệm thu và thiết bị/broker thật; không nên coi mô phỏng local là bằng chứng đã đạt.
-4. **Tài khoản:** user/admin hiện là tài khoản demo hardcode trong app, phiên đăng nhập nằm trong RAM; collection `users` là metadata, chưa phải hệ thống đăng ký/mật khẩu Firebase Auth. Không dùng tài khoản demo cho dữ liệu người dùng thật.
+4. **Tài khoản:** user/admin hiện là tài khoản demo hardcode trong app, phiên đăng nhập nằm trong RAM; chưa phải hệ thống đăng ký/mật khẩu Firebase Auth. Không dùng tài khoản demo cho dữ liệu người dùng thật.
 
 Nếu không dùng Git trên máy, giải nén ZIP rồi vào repo GitHub trên trình duyệt → **Add file → Upload files**, tải các file đã cập nhật lên đúng thư mục project và chọn **Commit changes**; Render sẽ tự deploy theo cấu hình repo. Không upload `.venv`, `rooms.db`, `__pycache__` hoặc JSON service account. Nếu deploy Firestore, giữ nguyên Secret File/biến môi trường Firebase ở Render và kiểm tra lại `/api/health` sau deploy.
 
