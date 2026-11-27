@@ -26,11 +26,11 @@ Không cần kích hoạt `.venv` bằng `Activate.ps1`. Mở http://127.0.0.1:8
 - Thẻ bốn phòng dùng ảnh chụp phòng học, phòng họp và phòng máy từ Unsplash; nếu ảnh mạng lỗi, thẻ tự dùng ảnh SVG dự phòng trong `static/images`.
 - Chatbot hiểu ngày như `29/09/2026`, `2026-09-29`, `ngày 29 tháng 9`, hôm nay/ngày mai và thứ trong tuần; thời lượng từ 1 phút (có thể ghi `2p` để test) đến 12 tiếng, ví dụ `90 phút`, `2 tiếng`, `2 tiếng 30 phút`.
 - Chatbot trả lời yêu cầu giới thiệu loại phòng bằng danh sách phòng, sức chứa, tiện nghi và giá lấy từ database.
-- Booking được chống xung đột bằng transaction SQLite/Firestore; vòng đời tự chuyển booking quá hạn chưa check-in sang `NO_SHOW`, tự kết thúc booking đã check-in và tắt thiết bị mô phỏng khi hết giờ. QR ký HMAC, gắn booking/phòng và thời hạn.
+- Booking được chống xung đột bằng transaction SQLite/Firestore và chống gửi lặp bằng idempotency. QR ký HMAC, gắn booking/phòng và hạn dùng; Firestore chỉ lưu SHA-256 của token, thời hạn và trạng thái `ACTIVE/USED/REVOKED/EXPIRED`.
 - Thiết bị trong phòng gồm đèn (`lamp`), quạt (`fan`) và loa (`speaker`). Check-in QR gửi lệnh bật cả ba; Admin xem trạng thái telemetry và bật/tắt từng thiết bị ngay trên dashboard.
 - MQTT dùng cho telemetry, trạng thái và lệnh thiết bị. HTTP API tiếp tục hỗ trợ mô phỏng và các thao tác request/response như login, booking, cập nhật phòng.
 - Admin dashboard hiển thị occupancy, controller online/offline, trạng thái đèn/quạt/loa, booking và audit log; dữ liệu tự làm mới mỗi 10 giây. Admin có thể khóa/mở thiết bị; thiết bị đã khóa không nhận lệnh bật từ dashboard.
-- Admin chỉnh tên phòng, sức chứa, giá riêng; quản lý ba tiện ích thiết bị Đèn, Quạt, Loa; bật/tắt tiện ích và gán riêng cho từng phòng. Sau nâng cấp, cả ba tiện ích được gán cho mọi phòng một lần để người dùng có thể chọn chúng ở bất kỳ phòng nào; Admin vẫn có thể tùy chỉnh gán tiện ích từng phòng về sau. User chọn tiện ích phía dưới để lọc phòng. SQLite/Firebase lưu tiện ích tách khỏi document phòng.
+- Admin chỉnh tên phòng, sức chứa, giá riêng; quản lý Đèn, Quạt, Loa, gán theo phòng và đặt phí tiện ích theo giờ. Giá mặc định là Đèn 2.000₫, Quạt 3.000₫, Loa 5.000₫/giờ; Admin có thể đổi. Khi đặt, tổng tiền = tiền phòng theo giờ + phí từng tiện ích đã chọn theo thời lượng. Booking lưu cả tiền phòng, phí tiện ích và tổng tiền. SQLite/Firebase lưu danh mục tiện ích riêng khỏi document phòng.
 
 ## API chính
 
@@ -48,7 +48,7 @@ Ngày giờ API dùng ISO 8601. Khi chưa đặt credential Firebase, app dùng 
 
 ### Cấu hình Firebase/Firestore
 
-Firestore được gom về 4 collection: `rooms`, `bookings`, `audit`, `app_meta`. Cấu hình tiện ích, trạng thái và thiết bị nằm trong phòng; lịch sử nằm trong booking; demo user được giữ trong app. Dữ liệu Firestore cũ được chuyển bằng script có xem trước và backup; xem [Hướng dẫn Firebase](docs/FIREBASE_UPLOAD.md). `/api/health` báo kết nối Firestore sau khi app khởi động.
+Firestore dùng các collection theo loại dữ liệu: `users`, `rooms`, `amenities`, `room_amenities`, `devices`, `bookings`, `qr_tokens`, `booking_events`, `device_logs`, `idempotency`, `audit` và `app_meta`. `rooms` giữ trạng thái mới nhất để giao diện đọc nhanh; lịch sử sự kiện booking, QR và telemetry được lưu riêng. `room_amenities` là bảng liên kết chuẩn, còn `amenity_ids` trong phòng là bản tóm tắt để tra phòng nhanh. `app_meta` chỉ giữ cấu hình/mốc migration, không giữ danh mục tiện ích nữa. Dữ liệu cũ được chuẩn hóa bằng script có xem trước và backup; xem [Hướng dẫn Firebase](docs/FIREBASE_UPLOAD.md). `/api/health` báo kết nối Firestore sau khi app khởi động.
 
 ## MQTT cho thiết bị
 
@@ -98,14 +98,14 @@ Nếu chưa cấu hình credential Firestore, Render chạy SQLite trên filesys
 
 ## Đối chiếu yêu cầu Capstone
 
-Đã có trong demo phần mềm: đăng nhập phân vai demo; tra phòng theo ngày/giờ/thời lượng/sức chứa/Đèn/Quạt/Loa; hội thoại nhiều lượt; booking, trạng thái, hủy, lịch sử sự kiện; chống trùng lịch và idempotency; QR HMAC với kiểm tra chủ booking/phòng/thời hạn/cửa sổ check-in; MQTT topic cho telemetry/status/command; giao diện quản trị occupancy, online/offline, thiết bị, cấu hình phòng/giá, cấu hình khóa thiết bị và audit; tự đánh dấu `NO_SHOW`, hoàn tất booking và tắt trạng thái thiết bị mô phỏng. Firestore dùng bốn collection cốt lõi; migration backup dữ liệu cũ trước khi loại các collection phụ.
+Đã có trong demo phần mềm: đăng nhập phân vai demo; tra phòng theo ngày/giờ/thời lượng/sức chứa/Đèn/Quạt/Loa; hội thoại nhiều lượt; booking, trạng thái, hủy, lịch sử sự kiện; chống trùng lịch và idempotency; QR HMAC với kiểm tra chủ booking/phòng/thời hạn/cửa sổ check-in; MQTT topic cho telemetry/status/command; giao diện quản trị occupancy, online/offline, thiết bị, cấu hình phòng/giá, cấu hình khóa thiết bị và audit; tự đánh dấu `NO_SHOW`, hoàn tất booking và tắt trạng thái thiết bị mô phỏng. Firestore tách lịch sử QR, booking và thiết bị; migration tạo backup trước khi chuẩn hóa.
 
 Các hạng mục chưa thể hoàn tất chỉ bằng demo web:
 
 1. **Phần cứng:** chưa có firmware ESP32/controller, cảm biến PIR, đầu đọc QR vật lý, watchdog, FSM chạy trực tiếp trên thiết bị, xử lý an toàn khi mất mạng/khởi động lại và xác nhận lệnh phần cứng. Backend nhận/gửi MQTT khi cấu hình broker; chức năng thiết bị hiện chưa chứng minh trên phần cứng thật.
 2. **Chatbot AI:** dùng Groq `openai/gpt-oss-20b` để trả lời câu hỏi chưa có mẫu; các câu hỏi booking và dữ liệu phòng vẫn do code cục bộ xử lý. Cần đặt `GROQ_API_KEY` trong Render Secret.
 3. **Kiểm thử nghiệm thu:** chưa chạy bộ 100 câu tiếng Việt, thử đặt đồng thời tải cao, đo thời gian QR dưới 2 giây, thử ngắt mạng/khôi phục với controller thật, hoặc xác minh quyền trên deployment Render/Firestore. Các mục này cần môi trường nghiệm thu và thiết bị/broker thật; không nên coi mô phỏng local là bằng chứng đã đạt.
-4. **Tài khoản:** user/admin hiện là tài khoản demo hardcode trong app, phiên đăng nhập nằm trong RAM; chưa phải hệ thống đăng ký/mật khẩu Firebase Auth. Không dùng tài khoản demo cho dữ liệu người dùng thật.
+4. **Tài khoản:** user/admin demo vẫn được định nghĩa trong app; tài khoản đăng ký được lưu trong `users` với mật khẩu đã băm. Phiên đăng nhập nằm trong RAM, chưa dùng Firebase Authentication. Không dùng tài khoản demo cho dữ liệu người dùng thật.
 
 Nếu không dùng Git trên máy, giải nén ZIP rồi vào repo GitHub trên trình duyệt → **Add file → Upload files**, tải các file đã cập nhật lên đúng thư mục project và chọn **Commit changes**; Render sẽ tự deploy theo cấu hình repo. Không upload `.venv`, `rooms.db`, `__pycache__` hoặc JSON service account. Nếu deploy Firestore, giữ nguyên Secret File/biến môi trường Firebase ở Render và kiểm tra lại `/api/health` sau deploy.
 

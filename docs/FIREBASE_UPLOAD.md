@@ -28,28 +28,38 @@ Mặc định script chỉ thêm document chưa có, nên có thể chạy lại
 
 ## Dữ liệu được tổ chức
 
-App dùng 4 collection cốt lõi:
-
 | Collection | Nội dung |
 |---|---|
-| `rooms` | Tên, sức chứa, giá, tiện ích, telemetry và cấu hình thiết bị |
-| `bookings` | Người đặt, phòng, thời gian, giá, trạng thái, tiện ích, hạn QR và lịch sử |
-| `audit` | Nhật ký thao tác quan trọng |
-| `app_meta` | Danh mục tiện ích, schema/migration và tài khoản đăng ký trong nhánh con `auth/users` |
+| `users` | Tài khoản đăng ký. Mật khẩu chỉ lưu dạng băm; không mở quyền đọc trực tiếp từ trình duyệt. |
+| `rooms` | Tên, sức chứa, giá, trạng thái mới nhất, cấu hình thiết bị và danh sách tiện ích để đọc nhanh. |
+| `amenities` | Danh mục Đèn, Quạt, Loa và giá theo giờ. |
+| `room_amenities` | Liên kết nhiều-nhiều phòng ↔ tiện ích. |
+| `devices` | Cấu hình và trạng thái mới nhất của từng thiết bị. |
+| `bookings` | Người đặt, phòng, khoảng thời gian, chi phí, trạng thái và tiện ích đã tính tiền. |
+| `qr_tokens` | Một bản ghi mỗi booking; chỉ lưu SHA-256 token, phòng, hạn dùng, trạng thái và thời gian sử dụng. |
+| `booking_events` | Lịch sử tạo, hủy, check-in, hoàn tất và no-show; không nhồi mảng lịch sử vào booking mới. |
+| `device_logs` | Lịch sử thay đổi trạng thái telemetry/điều khiển; ghi khi trạng thái đổi để giảm ghi lặp. |
+| `idempotency` | Hash của idempotency key và booking kết quả để request gửi lại không tạo booking trùng. |
+| `audit` | Nhật ký thao tác quản trị và hoạt động hệ thống. |
+| `app_meta` | Cấu hình và mốc migration, không lưu danh mục tiện ích. |
 
-Trước khi migrate, deploy code mới để app không còn ghi vào collection cũ. Sau đó xem trước dữ liệu cần gộp và dọn:
+Tạo booking kiểm tra xung đột trong Firestore transaction. Firestore không có exclusion constraint như PostgreSQL; backend dùng transaction và kiểm tra lịch đang giữ phòng. Các collection cũ sẽ được giữ lại trừ hai collection dư `room_status` và `events`; trước khi xóa, script tạo file backup đầy đủ.
+
+Index tổng hợp cho truy vấn booking của user nằm trong `firestore.indexes.json` (`user_id` + `status`). Các index đơn như `booking_id`, `room_id`, `token_hash` và `at` dùng index mặc định của Firestore.
+
+Xem trước migration:
 
 ```powershell
 .venv\Scripts\python.exe scripts\simplify_firestore.py --credentials .\firebase-service-account.json --project smart-booking-82438
 ```
 
-Kiểm tra số phòng và booking. Nếu đúng, chạy migration; script sao lưu dữ liệu trước khi chuyển trạng thái/thiết bị vào phòng, lịch sử vào booking và xóa các collection cũ:
+Kiểm tra số phòng, booking, tiện ích và lịch sử sự kiện. Nếu đúng, chạy migration có backup:
 
 ```powershell
 .venv\Scripts\python.exe scripts\simplify_firestore.py --credentials .\firebase-service-account.json --project smart-booking-82438 --apply --backup .\firestore-before-compact.json
 ```
 
-Sau migration, Firestore chỉ còn bốn collection cấp cao nhất: `rooms`, `bookings`, `audit`, `app_meta`. Tài khoản đăng ký được đặt trong subcollection `app_meta/auth/users`, mật khẩu được băm trước khi lưu; tài khoản mới chỉ có quyền user. Giữ JSON backup ở nơi an toàn; file có thể chứa cấu hình và lịch sử booking.
+Script chuẩn hóa danh mục tiện ích và booking events, rồi chỉ xóa `room_status` (trạng thái mới nhất đã nằm trong `rooms`) và `events` (được chuyển sang `booking_events`). Collection `amenities`, `room_amenities`, `devices`, `booking_events`, `idempotency`, `users`, `qr_tokens` và `device_logs` được giữ lại. App dùng `users/{username}` cho tài khoản mới và vẫn cho tài khoản cũ trong `app_meta/auth/users` đăng nhập. Giữ JSON backup ở nơi an toàn; file có thể chứa cấu hình và lịch sử booking.
 
 ## Kết nối ứng dụng
 

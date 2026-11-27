@@ -31,6 +31,7 @@ AMENITIES = {
     "fan": ("Quạt", "Điều khiển quạt trong phòng."),
     "speaker": ("Loa", "Phát âm thanh trong phòng."),
 }
+DEFAULT_AMENITY_RATES = {"lamp": 2000, "fan": 3000, "speaker": 5000}
 DEMO_USERS = {
     "demo-user": {"user_id": "demo-user", "username": "user", "role": "user", "name": "Người dùng demo", "demo": True},
     "demo-admin": {"user_id": "demo-admin", "username": "admin", "role": "admin", "name": "Quản trị viên", "demo": True},
@@ -90,6 +91,7 @@ def read_local_data(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
         devices = table_rows(connection, "devices")
         amenities = table_rows(connection, "amenities")
         links = table_rows(connection, "room_amenities")
+        users = table_rows(connection, "users")
     finally:
         connection.close()
 
@@ -103,12 +105,22 @@ def read_local_data(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
         if canonical_id:
             room_links.setdefault(str(link["room_id"]), []).append(canonical_id)
 
-    output: dict[str, list[tuple[str, dict[str, Any]]]] = {name: [] for name in ("rooms", "bookings", "audit", "app_meta")}
+    output: dict[str, list[tuple[str, dict[str, Any]]]] = {
+        name: [] for name in (
+            "users", "rooms", "amenities", "room_amenities", "devices", "bookings",
+            "booking_events", "idempotency", "audit", "app_meta",
+        )
+    }
     catalog_items = {}
     for amenity_id, (name, description) in AMENITIES.items():
         raw = next((item for item in amenities if str(item.get("name", "")).casefold() == name.casefold()), {})
-        catalog_items[amenity_id] = {"name": name, "description": description, "enabled": bool(raw.get("enabled", True))}
-    output["app_meta"].append(("amenities", {"items": catalog_items}))
+        catalog_items[amenity_id] = {
+            "name": name,
+            "description": description,
+            "enabled": bool(raw.get("enabled", True)),
+            "hourly_rate": int(raw.get("hourly_rate", DEFAULT_AMENITY_RATES[amenity_id])),
+        }
+    output["amenities"].extend((key, item) for key, item in catalog_items.items())
     for raw in rooms:
         room_id = int(raw["id"])
         room = {key: raw.get(key) for key in (
@@ -123,26 +135,52 @@ def read_local_data(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
         for device, column in DEVICE_COLUMNS.items():
             config = next((item for item in devices if int(item["room_id"]) == room_id and item["device"] == device), {})
             room["device_config"][device] = {"name": config.get("name") or AMENITIES[device][0], "enabled": bool(config.get("enabled", True))}
+            output["devices"].append((f"{room_id}_{device}", {
+                "room_id": room_id, "device": device,
+                **room["device_config"][device],
+                "state": "ON" if room.get(DEVICE_COLUMNS[device], False) else "OFF",
+                "updated_at": room.get("last_seen"),
+            }))
         output["rooms"].append((str(room_id), room))
+        for amenity_id in room["amenity_ids"]:
+            output["room_amenities"].append((f"{room_id}_{amenity_id}", {"room_id": room_id, "amenity_id": amenity_id}))
     output["app_meta"].extend([
         ("render_bootstrap_v1", {"version": 1, "source": "sqlite_upload"}),
         ("sqlite_initial_upload_v1", {"version": 1, "source": "sqlite_upload"}),
         ("amenity_catalog_v4", {"version": 4, "source": "sqlite_upload"}),
+        ("amenity_prices_v1", {"version": 1, "source": "sqlite_upload"}),
         ("all_rooms_have_all_amenities_v3", {"version": 3, "source": "sqlite_upload"}),
+        ("all_rooms_have_all_amenities_v4", {"version": 4, "source": "sqlite_upload"}),
+        ("normalized_devices_v1", {"version": 1, "source": "sqlite_upload"}),
         ("compact_schema_v1", {"version": 1, "source": "sqlite_upload"}),
     ])
 
-    events_by_booking: dict[str, list[dict[str, Any]]] = {}
     for row in events:
-        events_by_booking.setdefault(str(row.get("booking_id", "")), []).append({
-            "event": row.get("event"), "at": row.get("at"), "detail": row.get("detail", "")
-        })
+        booking_id = str(row.get("booking_id", ""))
+        event = {
+            "booking_id": booking_id, "event": row.get("event"),
+            "at": row.get("at"), "detail": row.get("detail", ""),
+        }
+        if booking_id:
+            event_id = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()[:40]
+            output["booking_events"].append((event_id, event))
     for booking in bookings:
         booking_id = str(booking["id"])
         payload = dict(booking)
         payload.pop("id", None)
-        payload["events"] = events_by_booking.get(booking_id, [])
+        idempotency_key = str(payload.pop("idempotency_key", "") or "")
+        if idempotency_key:
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+            output["idempotency"].append((key_hash, {
+                "idempotency_key_hash": key_hash, "booking_id": booking_id,
+                "created_at": booking.get("created", ""),
+            }))
         output["bookings"].append((booking_id, payload))
+    for user in users:
+        username = str(user.get("username", "")).strip().casefold()
+        if username:
+            payload = dict(user)
+            output["users"].append((username, payload))
     for collection, rows in (("audit", audit),):
         for row in rows:
             document_id = str(row.get("id") or hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest())

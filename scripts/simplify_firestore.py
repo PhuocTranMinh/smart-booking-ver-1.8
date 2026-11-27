@@ -1,4 +1,4 @@
-"""Compact legacy Firestore data into rooms, bookings, audit, and app_meta.
+"""Compact duplicate legacy state while retaining normalized Firestore entities.
 
 Preview only:
   python scripts/simplify_firestore.py --credentials firebase-service-account.json
@@ -8,6 +8,7 @@ Apply (creates a complete JSON backup first):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +24,11 @@ AMENITIES = {
     "speaker": {"name": "Loa", "description": "Phát âm thanh trong phòng."},
 }
 DEVICE_COLUMNS = {"lamp": "light_on", "fan": "fan_on", "speaker": "speaker_on"}
-LEGACY_COLLECTIONS = (
-    "amenities", "room_amenities", "room_status", "devices",
-    "booking_events", "idempotency", "users", "events",
+DEFAULT_AMENITY_RATES = {"lamp": 2000, "fan": 3000, "speaker": 5000}
+LEGACY_COLLECTIONS = ("room_status", "events")
+PRESERVED_COLLECTIONS = (
+    "amenities", "room_amenities", "devices", "booking_events", "idempotency",
+    "users", "qr_tokens", "device_logs",
 )
 
 
@@ -34,7 +37,7 @@ def event_key(row: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gom Firestore về 4 collection cốt lõi.")
+    parser = argparse.ArgumentParser(description="Chuẩn hóa Firestore, giữ các collection theo mô hình booking và IoT.")
     parser.add_argument("--credentials", required=True, help="Đường dẫn JSON service account")
     parser.add_argument("--project", default="smart-booking-82438")
     parser.add_argument("--apply", action="store_true", help="Ghi dữ liệu gộp và xóa collection cũ")
@@ -47,7 +50,7 @@ def main() -> int:
     client = firestore.Client(project=args.project, credentials=credentials)
     docs: dict[str, list[Any]] = {
         name: list(client.collection(name).stream())
-        for name in (*LEGACY_COLLECTIONS, "rooms", "bookings", "audit", "app_meta")
+        for name in (*LEGACY_COLLECTIONS, *PRESERVED_COLLECTIONS, "rooms", "bookings", "audit", "app_meta")
     }
     room_docs = docs["rooms"]
     booking_docs = docs["bookings"]
@@ -120,12 +123,13 @@ def main() -> int:
         updates["amenities"] = firestore.DELETE_FIELD
         room_updates[doc.id] = updates
 
+    booking_ids = {snapshot.id for snapshot in booking_docs}
     booking_events_by_id: dict[str, list[dict[str, Any]]] = {}
     for source in (docs["booking_events"], docs["events"]):
         for doc in source:
             row = doc.to_dict() or {}
             booking_id = str(row.get("booking_id", ""))
-            if booking_id and booking_id in {snapshot.id for snapshot in booking_docs}:
+            if booking_id and booking_id in booking_ids:
                 booking_events_by_id.setdefault(booking_id, []).append({
                     "booking_id": booking_id,
                     "event": row.get("event", ""),
@@ -133,16 +137,38 @@ def main() -> int:
                     "detail": row.get("detail", ""),
                 })
     booking_updates: dict[str, dict[str, Any]] = {}
+    normalized_booking_events: dict[str, dict[str, Any]] = {}
+    normalized_idempotency: dict[str, dict[str, Any]] = {}
     for doc in booking_docs:
         booking = doc.to_dict() or {}
-        events = list(booking.get("events", []))
-        known = {event_key(event) for event in events if isinstance(event, dict)}
+        embedded_events = booking.get("events", [])
+        events = [dict(event, booking_id=doc.id) for event in embedded_events if isinstance(event, dict)] if isinstance(embedded_events, list) else []
+        known = {event_key(event) for event in events}
         for event in booking_events_by_id.get(doc.id, []):
             key = event_key(event)
             if key not in known:
                 events.append(event)
                 known.add(key)
-        booking_updates[doc.id] = {"events": events}
+        for event in events:
+            normalized = {
+                "booking_id": doc.id,
+                "event": str(event.get("event", "")),
+                "at": str(event.get("at", "")),
+                "detail": str(event.get("detail", "")),
+            }
+            event_id = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:40]
+            normalized_booking_events[event_id] = normalized
+        old_idempotency_key = str(booking.get("idempotency_key") or "")
+        if old_idempotency_key:
+            key_hash = hashlib.sha256(old_idempotency_key.encode()).hexdigest()
+            normalized_idempotency[key_hash] = {
+                "idempotency_key_hash": key_hash, "booking_id": doc.id,
+                "created_at": str(booking.get("created", "")),
+            }
+        booking_updates[doc.id] = {
+            "events": firestore.DELETE_FIELD,
+            "idempotency_key": firestore.DELETE_FIELD,
+        }
 
     catalog_items = {}
     for key, default in AMENITIES.items():
@@ -150,14 +176,15 @@ def main() -> int:
         catalog_items[key] = {
             **default,
             "enabled": bool(old.get("enabled", True)),
+            "hourly_rate": int(old.get("hourly_rate", DEFAULT_AMENITY_RATES[key])),
         }
 
     print(f"Firestore project: {args.project}")
-    print(f"Canonical collections to keep: rooms ({len(room_docs)}), bookings ({len(booking_docs)}), audit ({len(docs['audit'])}), app_meta ({len(docs['app_meta']) + 1})")
-    print("Legacy collections that will be removed:")
+    print(f"Core documents: rooms ({len(room_docs)}), bookings ({len(booking_docs)}), audit ({len(docs['audit'])})")
+    print("Redundant collections that will be removed:")
     for name in LEGACY_COLLECTIONS:
         print(f"  {name}: {len(docs[name])} documents")
-    print(f"Room documents to normalize: {len(room_updates)}; booking histories to embed: {len(booking_updates)}")
+    print(f"Room documents to normalize: {len(room_updates)}; booking events: {len(normalized_booking_events)}; idempotency keys: {len(normalized_idempotency)}")
     if not args.apply:
         print("Preview only. No Firestore data was changed.")
         print("After deploying the updated app, rerun with --apply --backup <new-json-file>.")
@@ -177,10 +204,11 @@ def main() -> int:
     }
     backup_path.write_text(json.dumps(backup, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
-    meta_ref = client.collection("app_meta").document("amenities")
-    meta_ref.set({"items": catalog_items})
     batch = client.batch()
     writes = 0
+    for key, item in catalog_items.items():
+        batch.set(client.collection("amenities").document(key), item, merge=True)
+        writes += 1
     for doc_id, updates in room_updates.items():
         batch.set(room_by_id[doc_id].reference, updates, merge=True)
         writes += 1
@@ -195,8 +223,28 @@ def main() -> int:
             batch.commit()
             batch = client.batch()
             writes = 0
+    for event_id, event in normalized_booking_events.items():
+        batch.set(client.collection("booking_events").document(event_id), event, merge=True)
+        writes += 1
+        if writes >= 400:
+            batch.commit()
+            batch = client.batch()
+            writes = 0
+    for key_hash, result in normalized_idempotency.items():
+        batch.set(client.collection("idempotency").document(key_hash), result, merge=True)
+        writes += 1
+        if writes >= 400:
+            batch.commit()
+            batch = client.batch()
+            writes = 0
     if writes:
         batch.commit()
+
+    for key in AMENITIES:
+        saved = client.collection("amenities").document(key).get()
+        if not saved.exists or not (saved.to_dict() or {}).get("name"):
+            raise RuntimeError(f"Amenity migration verification failed for amenities/{key}; legacy data was kept")
+    client.collection("app_meta").document("amenities").delete()
 
     # Verify compact fields before deleting any legacy collection documents.
     for doc_id in room_updates:
@@ -215,7 +263,7 @@ def main() -> int:
     client.collection("app_meta").document("compact_schema_v1").set({
         "version": 1,
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        "kept_collections": ["rooms", "bookings", "audit", "app_meta"],
+        "kept_collections": ["rooms", "bookings", "users", "amenities", "room_amenities", "devices", "qr_tokens", "booking_events", "device_logs", "idempotency", "audit", "app_meta"],
         "backup_file": str(backup_path),
     })
     print(f"Compaction complete. Backup written to: {backup_path}")
