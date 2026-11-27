@@ -68,6 +68,10 @@ ROOM_AMENITIES = {
     "speaker": ("Loa", "Phát âm thanh trong phòng."),
 }
 DEFAULT_AMENITY_RATES = {"lamp": 2000, "fan": 3000, "speaker": 5000}
+DEFAULT_BOOKING_POLICY = {"min_duration_minutes": 1, "max_duration_minutes": 720}
+BOOKING_POLICY_CACHE: Optional[dict[str, int]] = None
+BOOKING_POLICY_CACHE_AT = 0.0
+BOOKING_POLICY_CACHE_LOCK = threading.RLock()
 LIFECYCLE_STOP = threading.Event()
 LIFECYCLE_THREAD = None
 app = FastAPI(title="Smart Study Room API", version="0.2.0")
@@ -101,6 +105,68 @@ def db():
         yield conn
     finally:
         conn.close()
+
+
+def get_booking_policy() -> dict[str, int]:
+    global BOOKING_POLICY_CACHE, BOOKING_POLICY_CACHE_AT
+    current = time.monotonic()
+    with BOOKING_POLICY_CACHE_LOCK:
+        if BOOKING_POLICY_CACHE is not None and current - BOOKING_POLICY_CACHE_AT < 30:
+            return dict(BOOKING_POLICY_CACHE)
+        policy = dict(DEFAULT_BOOKING_POLICY)
+        try:
+            if FIRESTORE is not None:
+                snapshot = FIRESTORE.collection("app_meta").document("booking_policy").get()
+                if snapshot.exists:
+                    raw = snapshot.to_dict() or {}
+                    policy.update({key: int(raw[key]) for key in DEFAULT_BOOKING_POLICY if key in raw})
+            else:
+                with db() as connection:
+                    row = connection.execute("SELECT value FROM app_meta WHERE key='booking_policy'").fetchone()
+                if row:
+                    policy.update({key: int(value) for key, value in json.loads(row["value"]).items() if key in DEFAULT_BOOKING_POLICY})
+        except Exception as exc:
+            if type(exc).__name__ != "ResourceExhausted":
+                raise
+            if BOOKING_POLICY_CACHE is not None:
+                return dict(BOOKING_POLICY_CACHE)
+        minimum, maximum = policy["min_duration_minutes"], policy["max_duration_minutes"]
+        if minimum < 1 or maximum > 720 or minimum > maximum:
+            policy = dict(DEFAULT_BOOKING_POLICY)
+        BOOKING_POLICY_CACHE = dict(policy)
+        BOOKING_POLICY_CACHE_AT = current
+        return dict(policy)
+
+
+def save_booking_policy(minimum: int, maximum: int) -> dict[str, int]:
+    global BOOKING_POLICY_CACHE, BOOKING_POLICY_CACHE_AT
+    policy = {"min_duration_minutes": minimum, "max_duration_minutes": maximum, "updated_at": stamp(now())}
+    if FIRESTORE is not None:
+        FIRESTORE.collection("app_meta").document("booking_policy").set(policy, merge=True)
+        fs_add_audit("admin", "BOOKING_POLICY_UPDATED", json.dumps(policy, ensure_ascii=False))
+    else:
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO app_meta(key,value) VALUES('booking_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(policy),),
+            )
+            audit(connection, "admin", "BOOKING_POLICY_UPDATED", json.dumps(policy, ensure_ascii=False))
+    result = {"min_duration_minutes": minimum, "max_duration_minutes": maximum}
+    with BOOKING_POLICY_CACHE_LOCK:
+        BOOKING_POLICY_CACHE = dict(result)
+        BOOKING_POLICY_CACHE_AT = time.monotonic()
+    return result
+
+
+def validate_booking_duration(start: datetime, end: datetime) -> None:
+    duration = (end - start).total_seconds() / 60
+    policy = get_booking_policy()
+    if not duration.is_integer() or not policy["min_duration_minutes"] <= duration <= policy["max_duration_minutes"]:
+        raise HTTPException(
+            400,
+            "Thời lượng thuê phải từ %s đến %s phút theo quy định hiện tại"
+            % (policy["min_duration_minutes"], policy["max_duration_minutes"]),
+        )
 
 
 def init_db() -> None:
@@ -1443,12 +1509,32 @@ def availability(start: str, end: str, people: int = 1, amenities: str = "", ide
     s, e = parse_dt(start), parse_dt(end)
     if s >= e or s < now() - timedelta(minutes=1):
         raise HTTPException(400, "Khoảng thời gian không hợp lệ")
+    validate_booking_duration(s, e)
     return free_rooms(s, e, people, resolve_amenity_filter([x.strip() for x in amenities.split(",") if x.strip()]))
 
 
 @app.get("/api/amenities")
 def amenities(identity: dict[str, str] = Depends(current_user)):
     return get_amenities()
+
+
+@app.get("/api/booking-policy")
+def booking_policy(identity: dict[str, str] = Depends(current_user)):
+    return get_booking_policy()
+
+
+@app.patch("/api/admin/booking-policy")
+def update_booking_policy(values: dict[str, Any], identity: dict[str, str] = Depends(current_user)):
+    require_admin(identity["role"])
+    allowed = {"min_duration_minutes", "max_duration_minutes"}
+    if set(values) != allowed:
+        raise HTTPException(400, "Cần nhập thời lượng thuê tối thiểu và tối đa")
+    if any(type(values[key]) is not int for key in allowed):
+        raise HTTPException(400, "Thời lượng phải là số phút nguyên")
+    minimum, maximum = values["min_duration_minutes"], values["max_duration_minutes"]
+    if minimum < 1 or maximum > 720 or minimum > maximum:
+        raise HTTPException(400, "Thời lượng phải nằm trong 1–720 phút và tối thiểu không được lớn hơn tối đa")
+    return {"ok": True, **save_booking_policy(minimum, maximum)}
 
 
 @app.get("/api/admin/amenities")
@@ -1540,6 +1626,7 @@ def create_booking(data: BookingIn, identity: dict[str, str] = Depends(current_u
     end = data.end.replace(tzinfo=timezone.utc) if data.end.tzinfo is None else data.end.astimezone(timezone.utc)
     if start >= end or start < now() - timedelta(minutes=1):
         raise HTTPException(400, "Khoảng thời gian không hợp lệ")
+    validate_booking_duration(start, end)
     amenity_items = resolve_booking_amenity_items(data.room_id, data.amenity_ids)
     amenities = [item["name"] for item in amenity_items]
     duration_hours = (end - start).total_seconds() / 3600
@@ -2090,6 +2177,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     message = data.message.strip()
     CHAT_REQUEST_MESSAGE.set(message)
     state = CHAT.setdefault(identity["user_id"] + ":" + data.session_id, {})
+    booking_policy = get_booking_policy()
     normalized = message.casefold()
     vietnamese_signal = bool(
         re.search(r"[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửựỳýỷỹỵ]", normalized)
@@ -2278,8 +2366,10 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                     if end_minutes <= start_minutes:
                         end_minutes += 24 * 60
                     duration_value = end_minutes - start_minutes
-                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and 1 <= duration_value <= 12 * 60:
+                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and booking_policy["min_duration_minutes"] <= duration_value <= booking_policy["max_duration_minutes"]:
                     state["duration_minutes"] = duration_value
+                elif isinstance(duration_value, int) and not isinstance(duration_value, bool):
+                    state.pop("duration_minutes", None)
             aliases_to_names = {
                 "đèn": "Đèn", "den": "Đèn", "lamp": "Đèn", "light": "Đèn", "lights": "Đèn",
                 "quạt": "Quạt", "quat": "Quạt", "fan": "Quạt", "fans": "Quạt",
@@ -2496,8 +2586,8 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         if end_minutes <= start_minutes:
             end_minutes += 24 * 60
         duration_minutes = end_minutes - start_minutes
-        if duration_minutes < 1 or duration_minutes > 12 * 60:
-            return _logged_chat_reply({"reply": "Thời lượng tính từ khoảng giờ phải từ 1 phút đến 12 tiếng. Hãy gửi lại giờ bắt đầu và giờ kết thúc.", "needs": ["time", "duration"]})
+        if duration_minutes < booking_policy["min_duration_minutes"] or duration_minutes > booking_policy["max_duration_minutes"]:
+            return _logged_chat_reply({"reply": f"Khoảng thời gian bạn chọn không đúng giới hạn thuê hiện tại ({booking_policy['min_duration_minutes']}–{booking_policy['max_duration_minutes']} phút). Hãy gửi lại giờ bắt đầu và kết thúc.", "needs": ["time", "duration"]})
         state["time"] = f"{start_minutes // 60 % 24:02d}:{start_minutes % 60:02d}"
         state["duration_minutes"] = duration_minutes
 
@@ -2544,8 +2634,8 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             minutes = round(float(duration_match.group(1).replace(",", ".")) * 60) + int(duration_match.group(3) or 0)
         else:
             minutes = int(duration_match.group(4))
-        if minutes < 1 or minutes > 12 * 60:
-            return _logged_chat_reply({"reply": "Thời lượng đặt phòng phải từ 1 phút đến 12 tiếng. Bạn muốn dùng phòng bao lâu?", "needs": ["duration"]})
+        if minutes < booking_policy["min_duration_minutes"] or minutes > booking_policy["max_duration_minutes"]:
+            return _logged_chat_reply({"reply": f"Thời lượng thuê hiện phải từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút. Bạn muốn thuê bao lâu?", "needs": ["duration"]})
         state["duration_minutes"] = minutes
 
     if not state.get("people"):
@@ -2555,10 +2645,13 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if not state.get("time"):
         return _logged_chat_reply({"reply": "Bạn muốn bắt đầu lúc mấy giờ? Ví dụ 14:30.", "needs": ["time"]})
     if not state.get("duration_minutes"):
-        reply = ("How long would you like to use the room? You can say 1–5 minutes for testing, 90 minutes, or 2 hours."
+        reply = (f"How long would you like to use the room? The current limit is {booking_policy['min_duration_minutes']}–{booking_policy['max_duration_minutes']} minutes."
                  if state.get("language") == "en" else
-                 "Bạn muốn sử dụng phòng trong bao lâu? Có thể chọn 1–5 phút để test, hoặc ghi 90 phút, 2 tiếng.")
+                 f"Bạn muốn thuê phòng trong bao lâu? Thời lượng hiện được phép từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút.")
         return _logged_chat_reply({"reply": reply, "needs": ["duration"]})
+    if not booking_policy["min_duration_minutes"] <= int(state["duration_minutes"]) <= booking_policy["max_duration_minutes"]:
+        state.pop("duration_minutes", None)
+        return _logged_chat_reply({"reply": f"Thời lượng thuê hiện phải từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút. Bạn muốn thuê bao lâu?", "needs": ["duration"]})
     start_local = datetime.combine(date.fromisoformat(state["date"]), datetime.strptime(state["time"], "%H:%M").time()).astimezone()
     if start_local <= now().astimezone():
         state.pop("time", None); state.pop("start", None); state.pop("end", None); state.pop("pending_confirm", None)
@@ -2609,35 +2702,19 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if not room_filter:
         choices.sort(key=lambda item: (int(item.get("hourly_rate", 0)), int(item.get("capacity", 0))))
         duration_hours = (state["end"] - state["start"]).total_seconds() / 3600
-        selected_names = {value.casefold() for value in required_amenities}
-        selected_catalog = [item for item in get_amenities() if item.get("name", "").casefold() in selected_names]
         state["room_options"] = [item["id"] for item in choices]
         state.pop("pending_confirm", None)
         if state.get("language") == "en":
-            lines = [
-                f"• {item['name']} — up to {item['capacity']} people; "
-                f"amenities: {', '.join(item.get('amenities') or []) or 'none listed'}; "
-                f"room {round(item.get('hourly_rate', 0) * duration_hours):,} VND"
-                + (f" + selected amenities {sum(round(int(a.get('hourly_rate', 0)) * duration_hours) for a in selected_catalog):,} VND" if selected_catalog else "")
-                + f"; estimated total {round(item.get('hourly_rate', 0) * duration_hours) + sum(round(int(a.get('hourly_rate', 0)) * duration_hours) for a in selected_catalog):,} VND"
-                for item in choices
-            ]
+            lines = [f"• {item['name']} — up to {item['capacity']} people; room {round(item.get('hourly_rate', 0) * duration_hours):,} VND" for item in choices]
             reply = (f"I found {len(choices)} available room(s) for {state['people']} people on "
                      f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
-                     f"{state['end'].astimezone():%H:%M}. Utilities are optional and can be selected after you pick a room:\n"
+                     f"{state['end'].astimezone():%H:%M}:\n"
                      + "\n".join(lines) + "\nReply with a room code (for example, D102) to continue.")
         else:
-            lines = [
-                f"• {item['name']} — tối đa {item['capacity']} người; "
-                f"tiện ích: {', '.join(item.get('amenities') or []) or 'chưa cấu hình'}; "
-                f"tiền phòng {round(item.get('hourly_rate', 0) * duration_hours):,}₫"
-                + (f" + tiện ích đã chọn {sum(round(int(a.get('hourly_rate', 0)) * duration_hours) for a in selected_catalog):,}₫" if selected_catalog else "")
-                + f"; tổng dự kiến {round(item.get('hourly_rate', 0) * duration_hours) + sum(round(int(a.get('hourly_rate', 0)) * duration_hours) for a in selected_catalog):,}₫"
-                for item in choices
-            ]
+            lines = [f"• {item['name']} — tối đa {item['capacity']} người; tiền phòng {round(item.get('hourly_rate', 0) * duration_hours):,}₫" for item in choices]
             reply = (f"Có {len(choices)} phòng còn trống cho {state['people']} người ngày "
                      f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
-                     f"{state['end'].astimezone():%H:%M}. Tiện ích là tùy chọn và sẽ chọn sau khi bạn chọn phòng:\n"
+                     f"{state['end'].astimezone():%H:%M}:\n"
                      + "\n".join(lines) + "\nBạn nhắn mã phòng (ví dụ D102) để tiếp tục nhé.")
         return _logged_chat_reply({"reply": reply, "rooms": choices, "needs": ["room"]})
 
