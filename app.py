@@ -2292,12 +2292,8 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                         requested_amenities.add(aliases_to_names[value.casefold()])
                 if requested_amenities:
                     state["amenities"] = sorted(requested_amenities)
-            ai_room_name = groq_booking_slots.get("room_name")
-            if isinstance(ai_room_name, str) and ai_room_name.strip():
-                matched_room = next((room for room in available_rooms if ai_room_name.casefold() in room.get("name", "").casefold()), None)
-                if matched_room:
-                    room_filter = matched_room.get("name")
-                    state["room_filter"] = room_filter
+            # Let the local parser detect an explicitly mentioned room code/name.
+            # Never let Groq choose a room on the user's behalf before they see options.
             print("CHAT_PARSE source=groq intent=book_room model=%s" % GROQ_MODEL, flush=True)
 
     if re.search(r"(trạng thái|tình trạng).*(booking|đặt phòng)|booking.*(của tôi|nào|trạng thái)|đặt phòng của tôi", normalized):
@@ -2569,13 +2565,16 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         return _logged_chat_reply({"reply": "Giờ bắt đầu đó đã qua. Hãy chọn một giờ trong tương lai (hoặc đổi sang ngày khác).", "needs": ["time"]})
     state["start"] = start_local.astimezone(timezone.utc)
     state["end"] = state["start"] + timedelta(minutes=state["duration_minutes"])
-    choices = free_rooms(state["start"], state["end"], state["people"], state.get("amenities"))
+    # Utilities are booking add-ons, not a prerequisite for room discovery.
+    # Ask about them only after the user has picked a room.
+    required_amenities = state.get("amenities", []) if state.get("amenities_step_done") else []
+    choices = free_rooms(state["start"], state["end"], state["people"], required_amenities)
     if room_filter:
         choices = [room for room in choices if (room_filter.casefold() in room.get("name", "").casefold())]
     if not choices:
         inventory = available_rooms or []
         capacity_rooms = [room for room in inventory if int(room.get("capacity", 0)) >= state["people"]]
-        requested_amenities = {value.casefold() for value in state.get("amenities", [])}
+        requested_amenities = {value.casefold() for value in required_amenities}
         amenity_rooms = [
             room for room in capacity_rooms
             if requested_amenities.issubset({value.casefold() for value in (room.get("amenities") or [])})
@@ -2595,7 +2594,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                 amenity for room in capacity_rooms for amenity in (room.get("amenities") or [])
             })
             suggestion = " Có thể bỏ bớt tiện ích hoặc chọn tiện ích đang có: " + ", ".join(available) + "." if available else " Các phòng đủ chỗ hiện chưa được gắn tiện ích nào."
-            reason = f"Không có phòng đủ chỗ đồng thời có đủ tiện ích {', '.join(state.get('amenities', []))}.{suggestion}"
+            reason = f"Không có phòng đủ chỗ đồng thời có đủ tiện ích {', '.join(required_amenities)}.{suggestion}"
         elif not matching_rooms:
             candidates = ", ".join(room.get("name", "Phòng") for room in amenity_rooms)
             reason = f"Không có phòng tên/loại '{room_filter}' thỏa các yêu cầu này. Phòng phù hợp về sức chứa và tiện ích hiện có: {candidates}."
@@ -2610,7 +2609,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if not room_filter:
         choices.sort(key=lambda item: (int(item.get("hourly_rate", 0)), int(item.get("capacity", 0))))
         duration_hours = (state["end"] - state["start"]).total_seconds() / 3600
-        selected_names = {value.casefold() for value in state.get("amenities", [])}
+        selected_names = {value.casefold() for value in required_amenities}
         selected_catalog = [item for item in get_amenities() if item.get("name", "").casefold() in selected_names]
         state["room_options"] = [item["id"] for item in choices]
         state.pop("pending_confirm", None)
@@ -2625,7 +2624,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             ]
             reply = (f"I found {len(choices)} available room(s) for {state['people']} people on "
                      f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
-                     f"{state['end'].astimezone():%H:%M}, with {', '.join(state.get('amenities', [])) or 'no required amenities'}:\n"
+                     f"{state['end'].astimezone():%H:%M}. Utilities are optional and can be selected after you pick a room:\n"
                      + "\n".join(lines) + "\nReply with a room code (for example, D102) to continue.")
         else:
             lines = [
@@ -2638,7 +2637,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             ]
             reply = (f"Có {len(choices)} phòng còn trống cho {state['people']} người ngày "
                      f"{state['start'].astimezone():%d/%m/%Y}, {state['start'].astimezone():%H:%M}–"
-                     f"{state['end'].astimezone():%H:%M}, với tiện ích {', '.join(state.get('amenities', [])) or 'không yêu cầu'}:\n"
+                     f"{state['end'].astimezone():%H:%M}. Tiện ích là tùy chọn và sẽ chọn sau khi bạn chọn phòng:\n"
                      + "\n".join(lines) + "\nBạn nhắn mã phòng (ví dụ D102) để tiếp tục nhé.")
         return _logged_chat_reply({"reply": reply, "rooms": choices, "needs": ["room"]})
 
@@ -2654,13 +2653,18 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if state.get("context_signature") is not None and state["context_signature"] != signature:
         state.pop("pending_confirm", None)
     state["context_signature"] = signature
-    if not state.get("amenities") and not state.get("amenities_step_done"):
+    if not state.get("amenities_step_done"):
+        suggested_amenities = list(state.get("amenities", []))
+        state.pop("amenities", None)
+        state["amenity_suggestions"] = suggested_amenities
         state["awaiting_amenities"] = True
         amenity_prices = ", ".join(f"{item['name']} {int(item.get('hourly_rate', 0)):,} VND/hour" for item in catalog)
         amenity_prices_vi = ", ".join("%s %s₫/giờ" % (item["name"], format(int(item.get("hourly_rate", 0)), ",")) for item in catalog)
-        prompt = (f"{room['name']} is available. Amenities cost per hour: {amenity_prices}. Would you like any? Reply with the amenities you want, or ‘none’ to skip."
+        suggested_en = (" You mentioned " + ", ".join(suggested_amenities) + "; would you like to add any of these?" if suggested_amenities else "")
+        suggested_vi = (" Bạn đã nhắc " + ", ".join(suggested_amenities) + "; bạn muốn chọn tiện ích nào trong số đó?" if suggested_amenities else "")
+        prompt = (f"{room['name']} is available. Amenities cost per hour: {amenity_prices}.{suggested_en} Choose fan, light, speaker, or ‘none’."
                   if state.get("language") == "en" else
-                  f"{room['name']} còn trống. Giá tiện ích theo giờ: {amenity_prices_vi}. Bạn muốn chọn loại nào? Nhắn tiện ích muốn dùng, hoặc ‘không cần’ để bỏ qua.")
+                  f"{room['name']} còn trống. Giá tiện ích theo giờ: {amenity_prices_vi}.{suggested_vi} Hãy nhắn đèn, quạt, loa hoặc ‘không cần’ để bỏ qua.")
         return _logged_chat_reply({"reply": prompt, "rooms": [room], "needs": ["amenities"]})
     start_local, end_local = state["start"].astimezone(), state["end"].astimezone()
     if state.get("language") == "en":
