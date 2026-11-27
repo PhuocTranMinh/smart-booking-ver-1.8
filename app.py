@@ -68,8 +68,8 @@ ROOM_AMENITIES = {
     "speaker": ("Loa", "Phát âm thanh trong phòng."),
 }
 DEFAULT_AMENITY_RATES = {"lamp": 2000, "fan": 3000, "speaker": 5000}
-DEFAULT_BOOKING_POLICY = {"min_duration_minutes": 1, "max_duration_minutes": 720}
-BOOKING_POLICY_CACHE: Optional[dict[str, int]] = None
+DEFAULT_BOOKING_POLICY = {"allowed_durations_minutes": [1, 2, *range(60, 721, 60)]}
+BOOKING_POLICY_CACHE: Optional[dict[str, Any]] = None
 BOOKING_POLICY_CACHE_AT = 0.0
 BOOKING_POLICY_CACHE_LOCK = threading.RLock()
 LIFECYCLE_STOP = threading.Event()
@@ -107,7 +107,7 @@ def db():
         conn.close()
 
 
-def get_booking_policy() -> dict[str, int]:
+def get_booking_policy() -> dict[str, Any]:
     global BOOKING_POLICY_CACHE, BOOKING_POLICY_CACHE_AT
     current = time.monotonic()
     with BOOKING_POLICY_CACHE_LOCK:
@@ -119,30 +119,34 @@ def get_booking_policy() -> dict[str, int]:
                 snapshot = FIRESTORE.collection("app_meta").document("booking_policy").get()
                 if snapshot.exists:
                     raw = snapshot.to_dict() or {}
-                    policy.update({key: int(raw[key]) for key in DEFAULT_BOOKING_POLICY if key in raw})
+                    durations = raw.get("allowed_durations_minutes")
+                    if isinstance(durations, list):
+                        policy["allowed_durations_minutes"] = sorted({int(value) for value in durations})
             else:
                 with db() as connection:
                     row = connection.execute("SELECT value FROM app_meta WHERE key='booking_policy'").fetchone()
                 if row:
-                    policy.update({key: int(value) for key, value in json.loads(row["value"]).items() if key in DEFAULT_BOOKING_POLICY})
+                    durations = json.loads(row["value"]).get("allowed_durations_minutes")
+                    if isinstance(durations, list):
+                        policy["allowed_durations_minutes"] = sorted({int(value) for value in durations})
         except Exception as exc:
             if type(exc).__name__ != "ResourceExhausted":
                 raise
             if BOOKING_POLICY_CACHE is not None:
                 return dict(BOOKING_POLICY_CACHE)
-        minimum, maximum = policy["min_duration_minutes"], policy["max_duration_minutes"]
-        if minimum < 1 or maximum > 720 or minimum > maximum:
+        durations = policy["allowed_durations_minutes"]
+        if not durations or any(value not in {1, 2, *range(60, 721, 60)} for value in durations):
             policy = dict(DEFAULT_BOOKING_POLICY)
         BOOKING_POLICY_CACHE = dict(policy)
         BOOKING_POLICY_CACHE_AT = current
         return dict(policy)
 
 
-def save_booking_policy(minimum: int, maximum: int) -> dict[str, int]:
+def save_booking_policy(durations: list[int]) -> dict[str, Any]:
     global BOOKING_POLICY_CACHE, BOOKING_POLICY_CACHE_AT
-    policy = {"min_duration_minutes": minimum, "max_duration_minutes": maximum, "updated_at": stamp(now())}
+    policy = {"allowed_durations_minutes": durations, "updated_at": stamp(now())}
     if FIRESTORE is not None:
-        FIRESTORE.collection("app_meta").document("booking_policy").set(policy, merge=True)
+        FIRESTORE.collection("app_meta").document("booking_policy").set(policy)
         fs_add_audit("admin", "BOOKING_POLICY_UPDATED", json.dumps(policy, ensure_ascii=False))
     else:
         with db() as connection:
@@ -151,7 +155,7 @@ def save_booking_policy(minimum: int, maximum: int) -> dict[str, int]:
                 (json.dumps(policy),),
             )
             audit(connection, "admin", "BOOKING_POLICY_UPDATED", json.dumps(policy, ensure_ascii=False))
-    result = {"min_duration_minutes": minimum, "max_duration_minutes": maximum}
+    result = {"allowed_durations_minutes": durations}
     with BOOKING_POLICY_CACHE_LOCK:
         BOOKING_POLICY_CACHE = dict(result)
         BOOKING_POLICY_CACHE_AT = time.monotonic()
@@ -161,12 +165,22 @@ def save_booking_policy(minimum: int, maximum: int) -> dict[str, int]:
 def validate_booking_duration(start: datetime, end: datetime) -> None:
     duration = (end - start).total_seconds() / 60
     policy = get_booking_policy()
-    if not duration.is_integer() or not policy["min_duration_minutes"] <= duration <= policy["max_duration_minutes"]:
+    if not duration.is_integer() or int(duration) not in policy["allowed_durations_minutes"]:
         raise HTTPException(
             400,
-            "Thời lượng thuê phải từ %s đến %s phút theo quy định hiện tại"
-            % (policy["min_duration_minutes"], policy["max_duration_minutes"]),
+            "Thời lượng thuê không nằm trong các lựa chọn hiện tại",
         )
+
+
+def booking_duration_labels(policy: dict[str, Any], english: bool = False) -> str:
+    labels = []
+    for minutes in policy["allowed_durations_minutes"]:
+        if minutes < 60:
+            labels.append(f"{minutes} minute test" if english else f"{minutes} phút test")
+        else:
+            hours = minutes // 60
+            labels.append(f"{hours} hour" + ("s" if hours != 1 else "") if english else f"{hours} tiếng")
+    return ", ".join(labels)
 
 
 def init_db() -> None:
@@ -1526,15 +1540,13 @@ def booking_policy(identity: dict[str, str] = Depends(current_user)):
 @app.patch("/api/admin/booking-policy")
 def update_booking_policy(values: dict[str, Any], identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
-    allowed = {"min_duration_minutes", "max_duration_minutes"}
-    if set(values) != allowed:
-        raise HTTPException(400, "Cần nhập thời lượng thuê tối thiểu và tối đa")
-    if any(type(values[key]) is not int for key in allowed):
-        raise HTTPException(400, "Thời lượng phải là số phút nguyên")
-    minimum, maximum = values["min_duration_minutes"], values["max_duration_minutes"]
-    if minimum < 1 or maximum > 720 or minimum > maximum:
-        raise HTTPException(400, "Thời lượng phải nằm trong 1–720 phút và tối thiểu không được lớn hơn tối đa")
-    return {"ok": True, **save_booking_policy(minimum, maximum)}
+    if set(values) != {"allowed_durations_minutes"}:
+        raise HTTPException(400, "Hãy chọn các thời lượng thuê được phép")
+    durations = values["allowed_durations_minutes"]
+    valid_durations = {1, 2, *range(60, 721, 60)}
+    if not isinstance(durations, list) or not durations or any(type(value) is not int or value not in valid_durations for value in durations):
+        raise HTTPException(400, "Chỉ chọn 1–2 phút để thử hoặc thời lượng nguyên tiếng từ 1 đến 12 tiếng")
+    return {"ok": True, **save_booking_policy(sorted(set(durations)))}
 
 
 @app.get("/api/admin/amenities")
@@ -2146,7 +2158,7 @@ def _logged_chat_reply(payload: dict, source: str = "local") -> dict:
             "Bạn cần phòng cho bao nhiêu người?": "How many people do you need the room for?",
             "Bạn muốn đặt phòng ngày nào? Hãy ghi ngày/tháng/năm hoặc nói hôm nay/ngày mai.": "Which date would you like to book? Please enter day/month/year or say today or tomorrow.",
             "Bạn muốn bắt đầu lúc mấy giờ? Ví dụ 14:30.": "What time would you like to start? For example, 2:30pm.",
-            "Bạn muốn sử dụng phòng trong bao lâu? Có thể chọn 1–5 phút để test, hoặc ghi 90 phút, 2 tiếng.": "How long would you like to use the room? You can say 1–5 minutes for testing, 90 minutes, or 2 hours.",
+            "Bạn muốn sử dụng phòng trong bao lâu? Chọn 1–2 phút để test hoặc các mức nguyên tiếng.": "How long would you like to use the room? Choose 1–2 minutes for testing or a whole number of hours.",
         }
         try:
             translated = groq_translate_chat_reply(user_message or "", reply, "English")
@@ -2366,7 +2378,7 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
                     if end_minutes <= start_minutes:
                         end_minutes += 24 * 60
                     duration_value = end_minutes - start_minutes
-                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and booking_policy["min_duration_minutes"] <= duration_value <= booking_policy["max_duration_minutes"]:
+                if isinstance(duration_value, int) and not isinstance(duration_value, bool) and duration_value in booking_policy["allowed_durations_minutes"]:
                     state["duration_minutes"] = duration_value
                 elif isinstance(duration_value, int) and not isinstance(duration_value, bool):
                     state.pop("duration_minutes", None)
@@ -2586,8 +2598,12 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
         if end_minutes <= start_minutes:
             end_minutes += 24 * 60
         duration_minutes = end_minutes - start_minutes
-        if duration_minutes < booking_policy["min_duration_minutes"] or duration_minutes > booking_policy["max_duration_minutes"]:
-            return _logged_chat_reply({"reply": f"Khoảng thời gian bạn chọn không đúng giới hạn thuê hiện tại ({booking_policy['min_duration_minutes']}–{booking_policy['max_duration_minutes']} phút). Hãy gửi lại giờ bắt đầu và kết thúc.", "needs": ["time", "duration"]})
+        if duration_minutes not in booking_policy["allowed_durations_minutes"]:
+            state.pop("duration_minutes", None)
+            reply = ("That time range doesn't match an available duration. Choose: " + booking_duration_labels(booking_policy, True) + "."
+                     if state.get("language") == "en" else
+                     "Khoảng giờ đó không khớp thời lượng cho phép. Hãy chọn: " + booking_duration_labels(booking_policy) + ".")
+            return _logged_chat_reply({"reply": reply, "needs": ["time", "duration"]})
         state["time"] = f"{start_minutes // 60 % 24:02d}:{start_minutes % 60:02d}"
         state["duration_minutes"] = duration_minutes
 
@@ -2634,8 +2650,12 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
             minutes = round(float(duration_match.group(1).replace(",", ".")) * 60) + int(duration_match.group(3) or 0)
         else:
             minutes = int(duration_match.group(4))
-        if minutes < booking_policy["min_duration_minutes"] or minutes > booking_policy["max_duration_minutes"]:
-            return _logged_chat_reply({"reply": f"Thời lượng thuê hiện phải từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút. Bạn muốn thuê bao lâu?", "needs": ["duration"]})
+        if minutes not in booking_policy["allowed_durations_minutes"]:
+            state.pop("duration_minutes", None)
+            reply = ("Please choose one of these durations: " + booking_duration_labels(booking_policy, True) + "."
+                     if state.get("language") == "en" else
+                     "Bạn hãy chọn một thời lượng có sẵn: " + booking_duration_labels(booking_policy) + ".")
+            return _logged_chat_reply({"reply": reply, "needs": ["duration"]})
         state["duration_minutes"] = minutes
 
     if not state.get("people"):
@@ -2645,13 +2665,16 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     if not state.get("time"):
         return _logged_chat_reply({"reply": "Bạn muốn bắt đầu lúc mấy giờ? Ví dụ 14:30.", "needs": ["time"]})
     if not state.get("duration_minutes"):
-        reply = (f"How long would you like to use the room? The current limit is {booking_policy['min_duration_minutes']}–{booking_policy['max_duration_minutes']} minutes."
+        reply = ("How long would you like to use the room? Choose: " + booking_duration_labels(booking_policy, True) + "."
                  if state.get("language") == "en" else
-                 f"Bạn muốn thuê phòng trong bao lâu? Thời lượng hiện được phép từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút.")
+                 "Bạn muốn thuê phòng trong bao lâu? Hãy chọn: " + booking_duration_labels(booking_policy) + ".")
         return _logged_chat_reply({"reply": reply, "needs": ["duration"]})
-    if not booking_policy["min_duration_minutes"] <= int(state["duration_minutes"]) <= booking_policy["max_duration_minutes"]:
+    if int(state["duration_minutes"]) not in booking_policy["allowed_durations_minutes"]:
         state.pop("duration_minutes", None)
-        return _logged_chat_reply({"reply": f"Thời lượng thuê hiện phải từ {booking_policy['min_duration_minutes']} đến {booking_policy['max_duration_minutes']} phút. Bạn muốn thuê bao lâu?", "needs": ["duration"]})
+        reply = ("Please choose one of these durations: " + booking_duration_labels(booking_policy, True) + "."
+                 if state.get("language") == "en" else
+                 "Bạn hãy chọn một thời lượng có sẵn: " + booking_duration_labels(booking_policy) + ".")
+        return _logged_chat_reply({"reply": reply, "needs": ["duration"]})
     start_local = datetime.combine(date.fromisoformat(state["date"]), datetime.strptime(state["time"], "%H:%M").time()).astimezone()
     if start_local <= now().astimezone():
         state.pop("time", None); state.pop("start", None); state.pop("end", None); state.pop("pending_confirm", None)
